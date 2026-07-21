@@ -1923,6 +1923,7 @@ class TestLoadGatewayConfig:
         config = load_config()
 
         assert config["telegram"]["extra"]["rich_messages"] is False
+        assert config["telegram"]["extra"]["rich_all_markdown"] is False
         assert config["telegram"]["extra"]["rich_drafts"] is False
 
     def test_bridges_telegram_extra_base_url_from_config_yaml(self, tmp_path, monkeypatch):
