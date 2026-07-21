@@ -894,9 +894,11 @@ gateway:
     telegram:
       extra:
         rich_messages: true
+        rich_all_markdown: false
+        rich_drafts: false
 ```
 
-这个设置用于客户端渲染/复制兼容性；当 Telegram 拒绝富消息 API 调用时，Hermes 已经会自动回退。如果你只是想在保持富消息启用的同时恢复旧版「始终使用代码块」表格行为，可在 `config.yaml` 中设置 `telegram.pretty_tables: false` 禁用表格规范化（默认：`true`）。
+这个设置用于客户端渲染/复制兼容性；当 Telegram 拒绝富消息 API 调用时，Hermes 已经会自动回退。设置 `rich_all_markdown: true` 后，每条符合条件的最终回复（包括普通标题和列表）都会作为富消息发送；现有的长度、CJK、已知崩溃和 API 回退保护仍然生效。`rich_drafts` 控制 Telegram 私聊流式传输期间的实验性富草稿预览，默认保持关闭，因为 Telegram Desktop/macOS 可能在聊天重绘前留下重叠的草稿帧。如果你只是想在保持富消息启用的同时恢复旧版「始终使用代码块」表格行为，可在 `config.yaml` 中设置 `telegram.pretty_tables: false` 禁用表格规范化（默认：`true`）。
 
 **链接预览。** Telegram 会为机器人消息中的 URL 自动生成链接预览。如果你希望抑制这些预览（长 `/tools` 输出、提及十个链接的 Agent 回复等）：
 
