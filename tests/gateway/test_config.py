@@ -827,6 +827,18 @@ class TestLoadGatewayConfig:
 
         assert config.platforms[Platform.TELEGRAM].extra["rich_messages"] is False
 
+    def test_load_config_default_keeps_telegram_rich_all_markdown_opt_in(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        from hermes_cli.config import load_config
+
+        config = load_config()
+
+        assert config["telegram"]["extra"]["rich_all_markdown"] is False
+
 
     def test_telegram_proxy_env_takes_precedence_over_config(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
