@@ -139,6 +139,24 @@ async def test_plain_markdown_stays_on_legacy_path():
 
 
 @pytest.mark.asyncio
+async def test_rich_all_markdown_sends_plain_markdown_as_rich_message():
+    """The operator opt-in renders ordinary headings and lists as rich."""
+    adapter = _make_adapter({"rich_all_markdown": True})
+    content = "## Summary\n\n- First item\n- Second item"
+
+    result = await adapter.send("12345", content)
+
+    assert result.success is True
+    assert result.message_id == "123"
+    adapter._bot.do_api_request.assert_awaited_once()
+    api_kwargs = _rich_api_kwargs(adapter)
+    markdown = api_kwargs["rich_message"]["markdown"]
+    assert markdown.startswith("## Summary\n\n")
+    assert "- First item  \n- Second item" in markdown
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_expect_edits_metadata_keeps_preview_on_legacy_path():
     adapter = _make_adapter()
 
