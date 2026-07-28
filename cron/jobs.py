@@ -1053,6 +1053,21 @@ def _compute_provider_model_snapshots(
     if bool(no_agent):
         return None, None
 
+    # Profile opt-out for users who deliberately want unpinned cron jobs to
+    # follow the current global provider/model without the spend-drift guard.
+    # This is intentionally local policy rather than the upstream default.
+    try:
+        import yaml
+
+        cfg_path = get_hermes_home() / "config.yaml"
+        with cfg_path.open(encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        cron_cfg = cfg.get("cron") or {}
+        if isinstance(cron_cfg, dict) and cron_cfg.get("follow_global_default") is True:
+            return None, None
+    except Exception:
+        pass
+
     provider_snapshot: Optional[str] = None
     model_snapshot: Optional[str] = None
     if normalized_provider is None:

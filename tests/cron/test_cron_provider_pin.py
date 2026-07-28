@@ -184,6 +184,26 @@ class TestCreateJobSnapshot:
         assert job["provider"] is None
         assert job["provider_snapshot"] == "openrouter"
 
+    def test_follow_global_default_skips_provider_and_model_snapshots(
+        self, monkeypatch, tmp_path
+    ):
+        jobs = self._isolate_storage(monkeypatch)
+        (tmp_path / "config.yaml").write_text(
+            "cron:\n  follow_global_default: true\n"
+            "model:\n  default: llama-3.3-70b:free\n"
+        )
+        monkeypatch.setattr(
+            "cron.jobs.get_hermes_home", lambda: tmp_path, raising=True
+        )
+        resolver = MagicMock(return_value={"provider": "openrouter"})
+
+        with patch("hermes_cli.runtime_provider.resolve_runtime_provider", resolver):
+            job = jobs.create_job(prompt="do a thing", schedule="every 1 hour")
+
+        assert job["provider_snapshot"] is None
+        assert job["model_snapshot"] is None
+        resolver.assert_not_called()
+
     def test_pinned_job_skips_snapshot(self, monkeypatch):
         jobs = self._isolate_storage(monkeypatch)
 
