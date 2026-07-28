@@ -61,6 +61,33 @@ class TestBackgroundTaskProfileScope:
         scope.assert_not_called()
         inner.assert_awaited_once()
 
+    def test_marks_background_runtime_as_unable_to_receive_late_completions(self):
+        """The copied /background context is finite; the live chat stays routable."""
+        from gateway.session_context import (
+            async_delivery_supported,
+            reset_session_vars,
+        )
+
+        runner = _make_runner(multiplex=False)
+        observed = []
+
+        async def observe_delivery_capability(*args):
+            observed.append(async_delivery_supported())
+
+        inner = mock.AsyncMock(side_effect=observe_delivery_capability)
+        runner._run_background_task_inner = inner
+        reset_session_vars()
+        assert async_delivery_supported() is True
+
+        asyncio.run(
+            runner._run_background_task(
+                prompt="test", source=mock.MagicMock(), task_id="bg_test"
+            )
+        )
+
+        assert observed == [False]
+        assert async_delivery_supported() is True
+
     def test_inner_receives_all_arguments(self):
         runner = _make_runner(multiplex=True)
         inner = mock.AsyncMock(return_value=None)
