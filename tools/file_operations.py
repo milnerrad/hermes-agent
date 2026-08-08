@@ -25,13 +25,14 @@ Usage:
     result = file_ops.search("TODO", path=".", file_glob="*.py")
 """
 
+import codecs
 import os
 import re
 import difflib
 import hashlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, ClassVar
+from typing import Optional, List, Dict, Any, ClassVar, Tuple
 from pathlib import Path
 from tools.binary_extensions import BINARY_EXTENSIONS
 
@@ -56,6 +57,49 @@ WRITE_DENIED_PREFIXES = build_write_denied_prefixes(_HOME)
 
 _OSC_SEQUENCE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _FENCE_MARKER_RE = re.compile(r"'?\x07?__HERMES_FENCE_[A-Za-z0-9]+__\x07?'?")
+
+_BINARY_SAMPLE_LIMIT = 1000
+_UTF8_BOUNDARY_LOOKAHEAD = 3
+_BINARY_SAMPLE_TRANSPORT_MARKER = "__HERMES_BINARY_SAMPLE_END__"
+
+
+@dataclass(frozen=True)
+class _BinarySampleTransport:
+    """Byte-safe bounded sample returned through the text-only exec API."""
+
+    data: Optional[bytes] = None
+    error: Optional[str] = None
+
+
+def _decode_utf8_boundary_sample(
+    data: bytes,
+    sample_limit: int = _BINARY_SAMPLE_LIMIT,
+) -> Optional[str]:
+    """Strictly decode a UTF-8 prefix while allowing one boundary split.
+
+    Bytes after ``sample_limit`` are consumed only to finish a character that
+    started inside the logical sample.  They are not otherwise classified.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    try:
+        text = decoder.decode(data[:sample_limit], final=False)
+    except UnicodeDecodeError:
+        return None
+
+    pending, _ = decoder.getstate()
+    if not pending:
+        return text
+
+    for value in data[sample_limit:sample_limit + _UTF8_BOUNDARY_LOOKAHEAD]:
+        try:
+            text += decoder.decode(bytes((value,)), final=False)
+        except UnicodeDecodeError:
+            return None
+        pending, _ = decoder.getstate()
+        if not pending:
+            return text
+
+    return None
 
 
 def _strip_terminal_fence_leaks(text: str) -> str:
@@ -882,34 +926,85 @@ class ShellFileOperations(FileOperations):
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
     
-    def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
+    def _read_binary_sample(self, path: str, file_size: int) -> _BinarySampleTransport:
+        """Read raw sample bytes as validated ASCII hex across the exec API."""
+        read_limit = _BINARY_SAMPLE_LIMIT + _UTF8_BOUNDARY_LOOKAHEAD
+        escaped = self._escape_shell_arg(path)
+        command = (
+            f"LC_ALL=C od -An -v -tx1 -N {read_limit} {escaped} 2>/dev/null "
+            f"&& printf '\\n{_BINARY_SAMPLE_TRANSPORT_MARKER}\\n'"
+        )
+        result = self._exec(command)
+        if result.exit_code != 0:
+            return _BinarySampleTransport(
+                error=f"byte-sample command failed with exit code {result.exit_code}"
+            )
+
+        output = _strip_terminal_fence_leaks(result.stdout)
+        if output.count(_BINARY_SAMPLE_TRANSPORT_MARKER) != 1:
+            return _BinarySampleTransport(
+                error="byte-sample transport marker missing or duplicated"
+            )
+        payload, trailer = output.split(_BINARY_SAMPLE_TRANSPORT_MARKER, 1)
+        if trailer.strip():
+            return _BinarySampleTransport(
+                error="unexpected data after byte-sample transport marker"
+            )
+        tokens = payload.split()
+        if any(re.fullmatch(r"[0-9A-Fa-f]{2}", token) is None for token in tokens):
+            return _BinarySampleTransport(
+                error="malformed hexadecimal byte-sample transport"
+            )
+        data = bytes(int(token, 16) for token in tokens)
+        expected = min(file_size, read_limit)
+        if len(data) != expected:
+            return _BinarySampleTransport(
+                error=(
+                    "truncated byte-sample transport "
+                    f"(expected {expected} bytes, received {len(data)})"
+                )
+            )
+        return _BinarySampleTransport(data=data)
+
+    def _is_likely_binary(
+        self,
+        path: str,
+        content_sample: Optional[bytes] = None,
+    ) -> bool:
         """
         Check if a file is likely binary.
         
-        Uses extension check (fast) + content analysis (fallback).
+        Uses extension check + strict byte-oriented content analysis.
         """
         ext = os.path.splitext(path)[1].lower()
         if ext in BINARY_EXTENSIONS:
             return True
         
-        # Content analysis: >30% non-printable chars = binary
-        if content_sample:
-            # Undecodable bytes: the terminal env decodes stdout with
-            # errors="replace", so any non-UTF-8 byte arrives here already
-            # turned into U+FFFD. That char is "printable" (ord 65533), so the
-            # non-printable ratio below never catches it — and returning the
-            # lossy text would let a read→edit→write round-trip silently
-            # overwrite the original bytes with mojibake. Treat a file whose
-            # sample carries the replacement char as binary (read-only) so the
-            # agent can't corrupt it. Legitimate UTF-8 text effectively never
-            # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
-                return True
-            non_printable = sum(1 for c in content_sample[:1000]
-                               if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
-        
-        return False
+        if content_sample is None:
+            return False
+        text = _decode_utf8_boundary_sample(
+            content_sample,
+            sample_limit=_BINARY_SAMPLE_LIMIT,
+        )
+        if text is None:
+            return True
+        if not text:
+            return False
+        non_printable = sum(
+            1 for char in text if ord(char) < 32 and char not in "\n\r\t"
+        )
+        return non_printable / len(text) > 0.30
+
+    def _inspect_binary_sample(
+        self, path: str, file_size: int
+    ) -> Tuple[Optional[bool], Optional[str]]:
+        if self._is_likely_binary(path):
+            return True, None
+        sample = self._read_binary_sample(path, file_size)
+        if sample.error:
+            return None, sample.error
+        assert sample.data is not None
+        return self._is_likely_binary(path, sample.data), None
     
     def _is_image(self, path: str) -> bool:
         """Check if file is an image we can return as base64."""
@@ -1188,12 +1283,13 @@ class ShellFileOperations(FileOperations):
                 ),
             )
         
-        # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        sample_result = self._exec(sample_cmd)
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        
-        if self._is_likely_binary(path, sample_output):
+        is_binary, sample_error = self._inspect_binary_sample(path, file_size)
+        if sample_error:
+            return ReadResult(
+                file_size=file_size,
+                error=f"Failed to inspect file safely before reading: {sample_error}",
+            )
+        if is_binary:
             return ReadResult(
                 is_binary=True,
                 file_size=file_size,
@@ -1307,9 +1403,13 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        if self._is_likely_binary(path, sample_output):
+        is_binary, sample_error = self._inspect_binary_sample(path, file_size)
+        if sample_error:
+            return ReadResult(
+                file_size=file_size,
+                error=f"Failed to inspect file safely before reading: {sample_error}",
+            )
+        if is_binary:
             return ReadResult(
                 is_binary=True, file_size=file_size,
                 error="Binary file — cannot display as text."

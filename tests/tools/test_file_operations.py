@@ -304,8 +304,8 @@ class TestShellFileOpsHelpers:
             commands.append(command)
             if command.startswith("wc -c"):
                 return {"output": "5\n", "returncode": 0}
-            if command.startswith("head -c"):
-                return {"output": "hello", "returncode": 0}
+            if "od -An -v -tx1" in command:
+                return {"output": "68 65 6c 6c 6f\n__HERMES_BINARY_SAMPLE_END__\n", "returncode": 0}
             if command.startswith("sed -n"):
                 return {"output": "hello\n", "returncode": 0}
             if command.startswith("wc -l"):
@@ -318,7 +318,7 @@ class TestShellFileOpsHelpers:
 
         assert result.error is None
         assert commands[0] == "wc -c < '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
+        assert "od -An -v -tx1 -N 1003 '/c/Users/alice/notes.txt'" in commands[1]
         assert commands[2] == "sed -n '1,2000p' '/c/Users/alice/notes.txt'"
         assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
 
@@ -345,8 +345,9 @@ class TestShellFileOpsHelpers:
         def side_effect(command, **kwargs):
             if command.startswith("wc -c"):
                 return {"output": "12\n", "returncode": 0}
-            if command.startswith("head -c"):
-                return {"output": "print('ok')\n", "returncode": 0}
+            if "od -An -v -tx1" in command:
+                sample = b"print('ok')\n"
+                return {"output": sample.hex(" ") + "\n__HERMES_BINARY_SAMPLE_END__\n", "returncode": 0}
             if command.startswith("sed -n"):
                 return {"output": leaked, "returncode": 0}
             if command.startswith("wc -l"):
@@ -373,8 +374,8 @@ class TestShellFileOpsHelpers:
         def side_effect(command, **kwargs):
             if command.startswith("wc -c"):
                 return {"output": "6\n", "returncode": 0}
-            if command.startswith("head -c"):
-                return {"output": "alpha\n", "returncode": 0}
+            if "od -An -v -tx1" in command:
+                return {"output": "61 6c 70 68 61 0a\n__HERMES_BINARY_SAMPLE_END__\n", "returncode": 0}
             if command.startswith("cat "):
                 return {"output": leaked, "returncode": 0}
             return {"output": "", "returncode": 0}
@@ -663,13 +664,74 @@ class TestReadNonUtf8IsBinary:
     read→edit→write round-trip would overwrite the original bytes with mojibake.
     """
 
-    def test_replacement_char_sample_flagged_binary(self, tmp_path):
+    def test_invalid_utf8_sample_flagged_binary(self, tmp_path):
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
-        # A latin-1 file decoded with errors="replace" yields U+FFFD chars.
-        lossy_sample = "caf\ufffd r\ufffdsum\ufffd\n"
-        assert ops._is_likely_binary("notes.txt", lossy_sample) is True
+        assert ops._is_likely_binary("notes.txt", b"caf\xff r\xe9sum\xe9\n") is True
 
     def test_plain_utf8_text_not_flagged(self, tmp_path):
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
-        assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+        assert ops._is_likely_binary(
+            "notes.txt", "café résumé\nsecond\n".encode()
+        ) is False
+
+    @pytest.mark.parametrize(
+        ("character", "bytes_before_boundary"),
+        [
+            ("é", 1),
+            ("”", 1),
+            ("”", 2),
+            ("😀", 1),
+            ("😀", 2),
+            ("😀", 3),
+        ],
+    )
+    def test_multibyte_character_crossing_byte_1000_reads_as_text(
+        self, tmp_path, character, bytes_before_boundary
+    ):
+        encoded = character.encode("utf-8")
+        path = tmp_path / "boundary.txt"
+        padding = 1000 - bytes_before_boundary
+        path.write_bytes(b"a" * padding + encoded + b"\n")
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+
+        result = ops.read_file(str(path))
+
+        assert result.error is None
+        assert result.is_binary is False
+        assert character in result.content
+
+    def test_literal_replacement_character_reads_as_text(self, tmp_path):
+        path = tmp_path / "literal.txt"
+        path.write_text("valid \ufffd text\n", encoding="utf-8")
+        result = ShellFileOperations(
+            make_real_subprocess_env(str(tmp_path))
+        ).read_file(str(path))
+        assert result.error is None
+        assert result.is_binary is False
+        assert "\ufffd" in result.content
+
+    def test_true_eof_incomplete_utf8_is_binary(self, tmp_path):
+        path = tmp_path / "incomplete.txt"
+        path.write_bytes(b"a" * 999 + b"\xe2")
+        result = ShellFileOperations(
+            make_real_subprocess_env(str(tmp_path))
+        ).read_file(str(path))
+        assert result.is_binary is True
+        assert result.error is not None
+
+    def test_malformed_byte_transport_fails_closed(self, mock_env):
+        def side_effect(command, **kwargs):
+            if command.startswith("wc -c"):
+                return {"output": "5\n", "returncode": 0}
+            if "od -An -v -tx1" in command:
+                return {
+                    "output": "68 65 NOT-HEX\n__HERMES_BINARY_SAMPLE_END__\n",
+                    "returncode": 0,
+                }
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        result = ShellFileOperations(mock_env).read_file("/tmp/test/a.txt")
+        assert result.error is not None
+        assert "malformed hexadecimal" in result.error
