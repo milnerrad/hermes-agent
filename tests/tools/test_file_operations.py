@@ -20,6 +20,7 @@ from tools.file_operations import (
     normalize_read_pagination,
     normalize_search_pagination,
 )
+from tools.environments.local import LocalEnvironment
 
 
 # =========================================================================
@@ -258,7 +259,8 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
         completed = subprocess.run(
             command,
             shell=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             input=kwargs.get("stdin_data"),
         )
@@ -700,6 +702,24 @@ class TestReadNonUtf8IsBinary:
         assert result.error is None
         assert result.is_binary is False
         assert character in result.content
+
+    @pytest.mark.parametrize("reader_name", ["read_file", "read_file_raw"])
+    def test_historical_boundary_file_through_local_environment(
+        self, tmp_path, reader_name
+    ):
+        path = tmp_path / "historical-boundary.md"
+        data = b"a" * 999 + b"\xe2\x80\x9d\n"
+        data += b"x" * (4109 - len(data))
+        assert len(data) == 4109
+        data.decode("utf-8", errors="strict")
+        path.write_bytes(data)
+        ops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)))
+
+        result = getattr(ops, reader_name)(str(path))
+
+        assert result.error is None
+        assert result.is_binary is False
+        assert "”" in result.content
 
     def test_literal_replacement_character_reads_as_text(self, tmp_path):
         path = tmp_path / "literal.txt"
