@@ -26,29 +26,29 @@ class TestIsLikelyBinary:
     def test_binary_extension_returns_true(self, ops):
         """Known binary extensions should short-circuit without content analysis."""
         assert ops._is_likely_binary("image.png") is True
-        assert ops._is_likely_binary("archive.tar.gz", content_sample="hello") is True
+        assert ops._is_likely_binary("archive.tar.gz", content_sample=b"hello") is True
 
     def test_text_content_returns_false(self, ops):
         """Normal printable text should not be classified as binary."""
-        sample = "Hello, world!\nThis is a normal text file.\n"
+        sample = b"Hello, world!\nThis is a normal text file.\n"
         assert ops._is_likely_binary("unknown.xyz", content_sample=sample) is False
 
 
     def test_just_above_threshold(self, ops):
         """301/1000 = 30.1% non-printable → should be binary."""
-        sample = "\x00" * 301 + "a" * 699
+        sample = b"\x00" * 301 + b"a" * 699
         assert ops._is_likely_binary("data.xyz", content_sample=sample) is True
 
     def test_tabs_and_newlines_excluded(self, ops):
         """Tabs, carriage returns, and newlines should not count as non-printable."""
-        sample = "\t" * 400 + "\n" * 300 + "\r" * 200 + "a" * 100
+        sample = b"\t" * 400 + b"\n" * 300 + b"\r" * 200 + b"a" * 100
         assert ops._is_likely_binary("file.txt", content_sample=sample) is False
 
     def test_content_sample_longer_than_1000(self, ops):
         """Only the first 1000 characters should be analysed."""
-        # First 1000 chars: 200 NUL + 800 printable = 20% → not binary
+        # First 1000 bytes: 200 NUL + 800 printable = 20% → not binary
         # Remaining 1000 chars: all NUL → ignored by [:1000] slice
-        sample = "\x00" * 200 + "a" * 800 + "\x00" * 1000
+        sample = b"\x00" * 200 + b"a" * 800 + b"\x00" * 1000
         assert ops._is_likely_binary("file.xyz", content_sample=sample) is False
 
 
@@ -207,8 +207,12 @@ class TestPaginationBounds:
             commands.append(command)
             if command.startswith("wc -c"):
                 return MagicMock(exit_code=0, stdout="12")
-            if command.startswith("head -c"):
-                return MagicMock(exit_code=0, stdout="line1\nline2\n")
+            if "od -An -v -tx1" in command:
+                sample = b"line1\nline2\n"
+                return MagicMock(
+                    exit_code=0,
+                    stdout=sample.hex(" ") + "\n__HERMES_BINARY_SAMPLE_END__\n",
+                )
             if command.startswith("sed -n"):
                 return MagicMock(exit_code=0, stdout="line1\n")
             if command.startswith("wc -l"):
