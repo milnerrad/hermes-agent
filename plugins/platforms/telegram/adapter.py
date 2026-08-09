@@ -5635,6 +5635,11 @@ class TelegramAdapter(BasePlatformAdapter):
         The buttons call ``resolve_gateway_approval()`` to unblock the waiting
         agent thread — same mechanism as the text ``/approve`` flow.
         """
+        if (metadata or {}).get("telegram_guest_query_id"):
+            return SendResult(
+                success=False,
+                error="Interactive approvals are unavailable for Telegram Guest Queries",
+            )
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -5766,6 +5771,11 @@ class TelegramAdapter(BasePlatformAdapter):
         text — no buttons.  The next message in the session is captured by
         the gateway's text-intercept and resolves the clarify.
         """
+        if (metadata or {}).get("telegram_guest_query_id"):
+            return SendResult(
+                success=False,
+                error="Interactive clarification is unavailable for Telegram Guest Queries",
+            )
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 

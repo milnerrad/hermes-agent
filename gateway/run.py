@@ -5159,6 +5159,12 @@ class TurnRunner:
 
             if not ctx._status_adapter:
                 return ""
+            if (ctx._status_thread_metadata or {}).get("telegram_guest_query_id"):
+                return (
+                    "[interactive clarification is unavailable for this one-shot "
+                    "Telegram Guest Query; continue with the safest reasonable "
+                    "assumption or explain what information is missing]"
+                )
 
             clarify_id = _uuid.uuid4().hex[:10]
             _clarify_mod.register(
@@ -5315,6 +5321,7 @@ class TurnRunner:
         from tools.approval import (
             register_gateway_notify,
             reset_current_session_key,
+            resolve_gateway_approval,
             set_current_session_key,
             unregister_gateway_notify,
         )
@@ -5327,6 +5334,16 @@ class TurnRunner:
                 UX.  Otherwise fall back to a plain text message with
                 ``/approve`` instructions.
                 """
+            if (ctx._status_thread_metadata or {}).get("telegram_guest_query_id"):
+                resolve_gateway_approval(
+                    _approval_session_key,
+                    "deny",
+                    reason=(
+                        "Interactive approval is unavailable for a one-shot "
+                        "Telegram Guest Query"
+                    ),
+                )
+                return
             # Pause the typing indicator while the agent waits for
             # user approval.  Critical for Slack's Assistant API where
             # assistant_threads_setStatus disables the compose box — the

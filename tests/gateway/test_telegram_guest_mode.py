@@ -401,6 +401,40 @@ async def test_intermediate_guest_send_is_suppressed():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method_name", ["send_exec_approval", "send_clarify"])
+async def test_guest_interactive_prompt_never_uses_normal_send(method_name):
+    """One-shot guest turns cannot receive interactive follow-up prompts."""
+    adapter = _adapter()
+    adapter._send_message_with_thread_fallback = AsyncMock(
+        return_value=SimpleNamespace(message_id=42)
+    )
+    adapter._approval_state = {}
+    adapter._clarify_state = {}
+    metadata = {"telegram_guest_query_id": "guest-query-1"}
+
+    if method_name == "send_exec_approval":
+        result = await adapter.send_exec_approval(
+            chat_id="111",
+            command="rm -rf /tmp/example",
+            session_key="telegram:111:guest:guest-query-1",
+            metadata=metadata,
+        )
+    else:
+        result = await adapter.send_clarify(
+            chat_id="111",
+            question="Which option?",
+            choices=["A", "B"],
+            clarify_id="clarify-1",
+            session_key="telegram:111:guest:guest-query-1",
+            metadata=metadata,
+        )
+
+    assert result.success is False
+    assert "Guest Quer" in (result.error or "")
+    adapter._send_message_with_thread_fallback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_degraded_final_guest_send_does_not_burn_one_shot():
     adapter = _adapter()
     adapter._send_path_degraded = True
