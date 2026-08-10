@@ -5447,6 +5447,13 @@ class BasePlatformAdapter(ABC):
         if result.success:
             return result
 
+        # Telegram Guest Queries permit exactly one answer. Any second send —
+        # including this generic retry/plain-text fallback path — violates the
+        # Bot API one-shot contract and can never recover an expired/consumed
+        # query. Preserve the original failure for delivery accounting.
+        if isinstance(metadata, dict) and metadata.get("telegram_guest_query_id"):
+            return result
+
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 

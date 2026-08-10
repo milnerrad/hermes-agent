@@ -596,6 +596,67 @@ async def test_guest_answer_failure_is_non_retryable(monkeypatch):
     assert result.error == "expired"
 
 
+@pytest.mark.asyncio
+async def test_guest_answer_failure_is_not_retried_or_plain_text_fallback(monkeypatch):
+    adapter = _adapter()
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.InputTextMessageContent",
+        lambda text, **kwargs: SimpleNamespace(message_text=text, **kwargs),
+    )
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.InlineQueryResultArticle",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    adapter._bot.answer_guest_query = AsyncMock(side_effect=RuntimeError("expired"))
+
+    result = await adapter._send_with_retry(
+        "1482299073",
+        "Too late",
+        metadata={
+            "telegram_guest_query_id": "5323706597129951744",
+            "notify": True,
+        },
+    )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert result.error == "expired"
+    adapter._bot.answer_guest_query.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_guest_answer_failure_redacts_telegram_token(caplog, monkeypatch):
+    adapter = _adapter()
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.InputTextMessageContent",
+        lambda text, **kwargs: SimpleNamespace(message_text=text, **kwargs),
+    )
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.InlineQueryResultArticle",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+    adapter._bot.answer_guest_query = AsyncMock(
+        side_effect=RuntimeError(f"request failed at https://api.telegram.org/bot{token}/answerGuestQuery")
+    )
+
+    with caplog.at_level("ERROR"):
+        result = await adapter.send(
+            "1482299073",
+            "Too late",
+            metadata={
+                "telegram_guest_query_id": "5323706597129951744",
+                "notify": True,
+            },
+        )
+
+    assert result.success is False
+    assert result.retryable is False
+    assert token not in (result.error or "")
+    assert token not in caplog.text
+    assert "***" in (result.error or "")
+
+
 # ---------------------------------------------------------------------------
 # Handler-registration regression coverage
 #

@@ -4614,8 +4614,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     ),
                 )
             except Exception as exc:
-                logger.exception("[%s] Failed to answer Telegram guest query", self.name)
-                return SendResult(success=False, error=str(exc), retryable=False)
+                safe_error = _redact_telegram_error_text(exc)
+                # Do not use logger.exception here: exception tracebacks include
+                # the original transport message and can expose the bot token
+                # embedded in Telegram API URLs.
+                logger.error(
+                    "[%s] Failed to answer Telegram guest query: %s",
+                    self.name,
+                    safe_error,
+                )
+                return SendResult(success=False, error=safe_error, retryable=False)
 
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
