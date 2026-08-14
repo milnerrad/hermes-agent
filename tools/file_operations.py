@@ -2912,7 +2912,7 @@ class ShellFileOperations(FileOperations):
 
         glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
         probe = self._exec(
-            f"rg -i --count-matches{glob_expr} "
+            f"rg -i --count-matches{glob_expr} -- "
             f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
@@ -2929,7 +2929,7 @@ class ShellFileOperations(FileOperations):
         # returning a bare zero (bench case: match in .hidden/ silently
         # missing from results).
         hidden = self._exec(
-            f"rg --hidden --no-ignore --count-matches{glob_expr} "
+            f"rg --hidden --no-ignore --count-matches{glob_expr} -- "
             f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
@@ -2943,7 +2943,7 @@ class ShellFileOperations(FileOperations):
             )
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = self._exec(
-                f"rg -F --count-matches{glob_expr} "
+                f"rg -F --count-matches{glob_expr} -- "
                 f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
                 f"2>/dev/null | head -50",
                 timeout=30,
@@ -3156,7 +3156,11 @@ class ShellFileOperations(FileOperations):
         elif output_mode == "count":
             cmd_parts.append("-c")  # Count per file
         
-        # Add pattern and path
+        # Add pattern and path. `--` stops option parsing so a pattern that
+        # starts with "-" (e.g. the Markdown checkbox "- [ ]") is not read
+        # as a flag by rg itself -- _escape_shell_arg's quoting only
+        # protects against shell word-splitting, not rg's own argv parsing.
+        cmd_parts.append("--")
         cmd_parts.append(self._escape_shell_arg(pattern))
         # rg is a native Windows binary when installed via winget/cargo/choco:
         # it needs the C:/... path form, not the MSYS /c/... form (which
@@ -3300,6 +3304,11 @@ class ShellFileOperations(FileOperations):
         # ``.*`` to exclude the entire search. Anchor relative paths at the
         # shell's live cwd; quoting $PWD separately keeps user paths escaped
         # while working across local, container, and remote backends.
+        # `--` stops option parsing so a pattern that starts with "-" (e.g.
+        # the Markdown checkbox "- [ ]") is not read as a flag by grep
+        # itself -- _escape_shell_arg's quoting only protects against shell
+        # word-splitting, not grep's own argv parsing.
+        cmd_parts.append("--")
         cmd_parts.append(self._escape_shell_arg(pattern))
         is_absolute = path.startswith(("/", "\\\\")) or bool(
             re.match(r"^[A-Za-z]:[\\/]", path)
