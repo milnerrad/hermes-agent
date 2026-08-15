@@ -152,22 +152,30 @@ def _contains_incomplete_tool_arguments(value: Any) -> bool:
     return False
 
 
+def _incomplete_tool_arguments_block_message(value: Any) -> Optional[str]:
+    """Return the common fail-closed message for lossy historical arguments."""
+    if not _contains_incomplete_tool_arguments(value):
+        return None
+    return (
+        "Hermes omitted these already-executed arguments during context "
+        "compression; the tool was not executed. Re-read or reconstruct "
+        "the complete current input before making a new call."
+    )
+
+
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
     """Parse model-emitted arguments and reject lossy historical previews."""
     try:
         arguments = json.loads(raw_arguments)
     except (json.JSONDecodeError, TypeError):
         arguments = None
-    if isinstance(arguments, dict) and _contains_incomplete_tool_arguments(arguments):
+    incomplete_message = _incomplete_tool_arguments_block_message(arguments)
+    if isinstance(arguments, dict) and incomplete_message:
         return {}, json.dumps(
             {
                 "error": "Incomplete historical tool arguments",
                 "error_type": "incomplete_historical_tool_arguments",
-                "message": (
-                    "Hermes omitted these already-executed arguments during context "
-                    "compression; the tool was not executed. Re-read or reconstruct "
-                    "the complete current input before making a new call."
-                ),
+                "message": incomplete_message,
             },
             ensure_ascii=False,
         )
@@ -877,7 +885,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if function_name == _ts.TOOL_CALL_NAME:
                 _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
                 if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
+                    _integrity_block = _incomplete_tool_arguments_block_message(_underlying_args)
+                    if _integrity_block:
+                        _ts_scope_block = _integrity_block
+                    elif _underlying in _tool_search_scoped_names(agent):
                         # Probe-validate before unwrapping (ironclaw#5149):
                         # missing required args return the parameter schema
                         # instead of dispatching into an opaque failure.
@@ -1718,7 +1729,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if function_name == _ts.TOOL_CALL_NAME:
                 _underlying, _underlying_args, _err = _ts.resolve_underlying_call(function_args)
                 if not _err and _underlying:
-                    if _underlying in _tool_search_scoped_names(agent):
+                    _integrity_block = _incomplete_tool_arguments_block_message(_underlying_args)
+                    if _integrity_block:
+                        _ts_scope_block = _integrity_block
+                    elif _underlying in _tool_search_scoped_names(agent):
                         # Probe-validate before unwrapping (ironclaw#5149):
                         # missing required args return the parameter schema
                         # instead of dispatching into an opaque failure.

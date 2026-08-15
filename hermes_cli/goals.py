@@ -1347,6 +1347,8 @@ class GoalManager:
                     existing = GoalState.from_json(raw)
                 except Exception as exc:
                     raise ValueError("stored goal state is corrupt") from exc
+                if existing.status not in {"active", "paused", "done", "cleared"}:
+                    raise ValueError("stored goal state is corrupt")
                 if existing.status in {"active", "paused"}:
                     raise GoalActivationConflict(
                         "session already has an active or paused goal"

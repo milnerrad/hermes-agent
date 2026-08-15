@@ -6,7 +6,11 @@ import json
 
 import pytest
 
-from agent.tool_executor import _parse_tool_arguments
+from agent.tool_executor import (
+    _incomplete_tool_arguments_block_message,
+    _parse_tool_arguments,
+)
+from tools.tool_search import resolve_underlying_call
 
 
 RESERVED = "__hermes_incomplete_tool_arguments__"
@@ -54,3 +58,39 @@ def test_literal_truncation_marker_is_not_treated_as_provenance():
 
     assert error is None
     assert arguments == payload
+
+
+def test_string_encoded_deferred_arguments_are_blocked_after_unwrap():
+    from tools.registry import registry
+
+    deferred_name = "mcp__integrity_probe__run"
+    registry.register(
+        name=deferred_name,
+        toolset="mcp-integrity-probe",
+        schema={
+            "name": deferred_name,
+            "description": "Integrity probe",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda args, **kwargs: "{}",
+    )
+    outer = {
+        "name": deferred_name,
+        "arguments": json.dumps(
+            {
+                RESERVED: {
+                    "version": 1,
+                    "reason": "context_compression",
+                    "replayable": False,
+                }
+            }
+        ),
+    }
+    parsed, error = _parse_tool_arguments(json.dumps(outer))
+    assert error is None
+
+    _name, underlying, resolve_error = resolve_underlying_call(parsed)
+    assert resolve_error is None
+    message = _incomplete_tool_arguments_block_message(underlying)
+    assert message is not None
+    assert "not executed" in message

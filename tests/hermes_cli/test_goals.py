@@ -158,10 +158,17 @@ class TestGoalManager:
         from hermes_cli import goals
 
         db = goals._get_session_db()
-        db.set_meta("goal:activation-corrupt", "not-json")
-        with pytest.raises(ValueError, match="corrupt"):
-            goals.GoalManager(session_id="activation-corrupt").activate_if_idle("new goal")
-        assert db.get_meta("goal:activation-corrupt") == "not-json"
+        corrupt_values = (
+            "not-json",
+            json.dumps({"goal": "operator-owned", "status": "unexpected"}),
+        )
+        for index, corrupt in enumerate(corrupt_values):
+            session_id = f"activation-corrupt-{index}"
+            key = f"goal:{session_id}"
+            db.set_meta(key, corrupt)
+            with pytest.raises(ValueError, match="corrupt"):
+                goals.GoalManager(session_id=session_id).activate_if_idle("new goal")
+            assert db.get_meta(key) == corrupt
 
     def test_activate_if_idle_allows_only_one_concurrent_winner(self, hermes_home):
         from hermes_cli.goals import GoalActivationConflict, GoalManager
