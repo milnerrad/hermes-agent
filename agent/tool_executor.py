@@ -138,12 +138,39 @@ class _BatchAbandoned(BaseException):
     """
 
 
+_INCOMPLETE_TOOL_ARGUMENTS_KEY = "__hermes_incomplete_tool_arguments__"
+
+
+def _contains_incomplete_tool_arguments(value: Any) -> bool:
+    """Detect reserved lossy-history provenance at any nesting depth."""
+    if isinstance(value, dict):
+        if _INCOMPLETE_TOOL_ARGUMENTS_KEY in value:
+            return True
+        return any(_contains_incomplete_tool_arguments(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_incomplete_tool_arguments(item) for item in value)
+    return False
+
+
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
-    """Parse model-emitted arguments without repairing or coercing them."""
+    """Parse model-emitted arguments and reject lossy historical previews."""
     try:
         arguments = json.loads(raw_arguments)
     except (json.JSONDecodeError, TypeError):
         arguments = None
+    if isinstance(arguments, dict) and _contains_incomplete_tool_arguments(arguments):
+        return {}, json.dumps(
+            {
+                "error": "Incomplete historical tool arguments",
+                "error_type": "incomplete_historical_tool_arguments",
+                "message": (
+                    "Hermes omitted these already-executed arguments during context "
+                    "compression; the tool was not executed. Re-read or reconstruct "
+                    "the complete current input before making a new call."
+                ),
+            },
+            ensure_ascii=False,
+        )
     if isinstance(arguments, dict):
         return arguments, None
     return {}, json.dumps(
