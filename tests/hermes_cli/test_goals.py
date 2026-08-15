@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -116,6 +118,69 @@ class TestGoalManager:
         assert mgr.is_active()
         assert "active" in mgr.status_line().lower()
         assert "port the thing" in mgr.status_line()
+
+    def test_activate_if_idle_refuses_active_or_paused_goal(self, hermes_home):
+        from hermes_cli.goals import GoalActivationConflict, GoalManager
+
+        mgr = GoalManager(session_id="activation-conflict", default_max_turns=5)
+        original = mgr.set("existing goal").to_json()
+        with pytest.raises(GoalActivationConflict):
+            GoalManager(session_id="activation-conflict").activate_if_idle("replacement")
+
+        db = __import__("hermes_cli.goals", fromlist=["_get_session_db"])._get_session_db()
+        assert db.get_meta("goal:activation-conflict") == original
+
+        mgr.pause("user pause")
+        paused = db.get_meta("goal:activation-conflict")
+        with pytest.raises(GoalActivationConflict):
+            GoalManager(session_id="activation-conflict").activate_if_idle("replacement")
+        assert db.get_meta("goal:activation-conflict") == paused
+
+    def test_activate_if_idle_replaces_terminal_state_and_preserves_contract(self, hermes_home):
+        from hermes_cli.goals import GoalContract, GoalManager
+
+        mgr = GoalManager(session_id="activation-terminal", default_max_turns=3)
+        mgr.set("old")
+        mgr.clear()
+        contract = GoalContract(outcome="phase done", verification="gate passes")
+        state = GoalManager(
+            session_id="activation-terminal",
+            default_max_turns=7,
+        ).activate_if_idle("Do Phase 4", contract=contract)
+
+        assert state.status == "active"
+        assert state.turns_used == 0
+        assert state.max_turns == 7
+        assert state.contract == contract
+        assert GoalManager(session_id="activation-terminal").state.to_json() == state.to_json()
+
+    def test_activate_if_idle_fails_closed_on_corrupt_state(self, hermes_home):
+        from hermes_cli import goals
+
+        db = goals._get_session_db()
+        db.set_meta("goal:activation-corrupt", "not-json")
+        with pytest.raises(ValueError, match="corrupt"):
+            goals.GoalManager(session_id="activation-corrupt").activate_if_idle("new goal")
+        assert db.get_meta("goal:activation-corrupt") == "not-json"
+
+    def test_activate_if_idle_allows_only_one_concurrent_winner(self, hermes_home):
+        from hermes_cli.goals import GoalActivationConflict, GoalManager
+
+        barrier = threading.Barrier(2)
+
+        def activate(goal):
+            manager = GoalManager(session_id="activation-race")
+            barrier.wait(timeout=5)
+            try:
+                return manager.activate_if_idle(goal).goal
+            except GoalActivationConflict:
+                return "conflict"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(activate, ["first", "second"]))
+
+        assert results.count("conflict") == 1
+        assert len(set(results) & {"first", "second"}) == 1
 
 
 

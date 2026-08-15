@@ -2210,6 +2210,13 @@ class TestStateMeta:
         db.set_meta("foo", "bar")
         assert db.get_meta("foo") == "bar"
 
+    def test_compare_and_set_meta_insert_update_and_conflict(self, db):
+        assert db.compare_and_set_meta("goal:sid", None, "first") is True
+        assert db.compare_and_set_meta("goal:sid", None, "other") is False
+        assert db.compare_and_set_meta("goal:sid", "wrong", "other") is False
+        assert db.compare_and_set_meta("goal:sid", "first", "second") is True
+        assert db.get_meta("goal:sid") == "second"
+
 
 
 class TestVacuum:

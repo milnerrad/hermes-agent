@@ -10047,6 +10047,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def compare_and_set_meta(
+        self,
+        key: str,
+        expected_value: Optional[str],
+        new_value: str,
+    ) -> bool:
+        """Atomically set a metadata value only when its current value matches.
+
+        ``expected_value=None`` means the key must not exist. The comparison and
+        write run in one immediate transaction so concurrent goal activation
+        cannot overwrite an active or paused session goal.
+        """
+        def _do(conn):
+            if expected_value is None:
+                cursor = conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO NOTHING",
+                    (key, new_value),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
+                    (new_value, key, expected_value),
+                )
+            return cursor.rowcount == 1
+
+        return self._execute_write(_do)
+
     def retag_kanban_worker_sessions(self, workspaces_root: str) -> int:
         """Retag legacy kanban worker rows from ``cli`` to ``kanban``.
 

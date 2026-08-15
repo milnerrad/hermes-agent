@@ -1236,6 +1236,10 @@ def _extract_json_object(raw: str) -> Optional[Dict[str, Any]]:
 # ──────────────────────────────────────────────────────────────────────
 
 
+class GoalActivationConflict(RuntimeError):
+    """An agent activation tried to replace an active or paused goal."""
+
+
 class GoalManager:
     """Per-session goal state + continuation decisions.
 
@@ -1302,6 +1306,56 @@ class GoalManager:
         return f"Goal ({s.status}, {meta}): {s.goal}"
 
     # --- mutation -----------------------------------------------------
+
+    def activate_if_idle(
+        self,
+        goal: str,
+        *,
+        max_turns: Optional[int] = None,
+        contract: Optional[GoalContract] = None,
+    ) -> GoalState:
+        """Atomically activate a goal without replacing active user state.
+
+        This stricter path is for agent-callable activation. Existing `/goal`
+        uses :meth:`set` and retains its explicit user-controlled replacement
+        semantics.
+        """
+        if not self.session_id:
+            raise ValueError("session_id is empty")
+        goal = (goal or "").strip()
+        if not goal:
+            raise ValueError("goal text is empty")
+
+        db = _get_session_db()
+        if db is None:
+            raise RuntimeError("goal persistence is unavailable")
+
+        state = GoalState(
+            goal=goal,
+            status="active",
+            turns_used=0,
+            max_turns=int(max_turns) if max_turns else self.default_max_turns,
+            created_at=time.time(),
+            last_turn_at=0.0,
+            contract=contract if contract is not None else GoalContract(),
+        )
+        key = _meta_key(self.session_id)
+        for _attempt in range(3):
+            raw = db.get_meta(key)
+            if raw is not None:
+                try:
+                    existing = GoalState.from_json(raw)
+                except Exception as exc:
+                    raise ValueError("stored goal state is corrupt") from exc
+                if existing.status in {"active", "paused"}:
+                    raise GoalActivationConflict(
+                        "session already has an active or paused goal"
+                    )
+            if db.compare_and_set_meta(key, raw, state.to_json()):
+                self._state = state
+                return state
+
+        raise RuntimeError("goal activation lost repeated persistence races")
 
     def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
         goal = (goal or "").strip()
