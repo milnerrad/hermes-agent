@@ -132,6 +132,12 @@ class TestGrepCommandIncludesEndOfOptionsSeparator:
             f"the -- separator must appear immediately before the quoted "
             f"pattern: {captured['command']!r}"
         )
+        # Positional check (review of #85798, point 3), robust to any
+        # future change in _escape_shell_arg's exact quoting format --
+        # not just this specific quoted-string shape.
+        sep_idx = captured["command"].index(" -- ")
+        pattern_idx = captured["command"].index("'-foo'")
+        assert sep_idx < pattern_idx
 
 
 class TestZeroMatchProbeIncludesEndOfOptionsSeparator:
