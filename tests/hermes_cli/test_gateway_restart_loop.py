@@ -847,6 +847,69 @@ PY
             command, cwd=str(tmp_path)
         ) is True
 
+    def test_subshell_function_override_of_non_shell_receiver_still_blocks(
+        self, tmp_path
+    ):
+        """A function may use a subshell compound command instead of braces."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        script = tmp_path / "restart.sh"
+        script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
+        command = f"""python3() ( sh )
+python3 <<'PY'
+sh {script}
+PY
+"""
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd=str(tmp_path)
+        ) is True
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "runner 'python3() ( sh )\ninert data'\n",
+            "# python3() ( sh )\n",
+        ],
+    )
+    def test_inert_function_lookalike_does_not_override_receiver(
+        self, prefix, tmp_path
+    ):
+        """Quoted text and comments cannot redefine a heredoc receiver."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        fifo = tmp_path / "python-data"
+        os.mkfifo(fifo)
+        command = f"""{prefix}python3 <<'PY'
+{fifo}
+PY
+"""
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd=str(tmp_path)
+        ) is False
+
+    def test_escaped_whitespace_keeps_hash_inside_word_for_override_detection(
+        self, tmp_path
+    ):
+        """Escaped whitespace joins the following hash to the current word."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        script = tmp_path / "restart.sh"
+        script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
+        for escaped_whitespace in ("\\ ", "\\\t"):
+            command = f""": prefix{escaped_whitespace}#literal; python3() {{ sh; }}
+python3 <<'PY'
+sh {script}
+PY
+"""
+            assert contains_gateway_lifecycle_command_or_referenced_script(
+                command, cwd=str(tmp_path)
+            ) is True
+
     def test_spoofed_receiver_direct_script_still_blocks(self, tmp_path):
         """Restricted body scanning retains obvious direct script execution."""
         from cron.lifecycle_guard import (
@@ -1084,6 +1147,94 @@ sh {script}
             command, cwd="/tmp"
         )
         assert isinstance(verdict, bool)
+
+    def test_multiline_single_quoted_data_path_is_not_script_walked(
+        self, tmp_path
+    ):
+        """A path inside one single-quoted argument remains inert data.
+
+        Line-by-line tokenization used to lose the opening quote, promote the
+        path to command position, and parse JavaScript bit shifts as nested
+        heredocs until the guard failed closed.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        bundle = tmp_path / "public" / "app.js"
+        bundle.parent.mkdir()
+        bundle.write_text(
+            "\n".join(f"lane{i} <<= 1;" for i in range(10)),
+            encoding="utf-8",
+        )
+        command = (
+            "codex-fallback 'Implement the approved scope:\n"
+            f"{bundle}\n"
+            "Keep acceptance unchanged.'"
+        )
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd=str(tmp_path)
+        ) is False
+
+    def test_double_quoted_multiline_substitution_still_blocks(self, tmp_path):
+        """Double-quoted command substitutions remain executable shell input."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        script = tmp_path / "restart.sh"
+        script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
+        command = f'runner "note\n$(sh {script})\nend"'
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd=str(tmp_path)
+        ) is True
+
+    def test_hash_inside_word_does_not_break_multiline_single_quote(self, tmp_path):
+        """An unquoted hash inside a shell word is literal, not a comment."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        fifo = tmp_path / "public" / "app.js"
+        fifo.parent.mkdir()
+        os.mkfifo(fifo)
+        command = f"runner tag#literal 'first line\n{fifo}\nlast line'"
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd=str(tmp_path)
+        ) is False
+
+    def test_single_quoted_multiline_argument_does_not_hide_following_command(
+        self, tmp_path
+    ):
+        """A real command after the quoted data remains a guarded segment."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        script = tmp_path / "restart.sh"
+        script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
+        command = f"runner 'safe data\npublic/app.js\n'; sh {script}"
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd=str(tmp_path)
+        ) is True
+
+    def test_unquoted_multiline_script_path_still_blocks(self, tmp_path):
+        """Newline command boundaries must remain visible to the guard."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        script = tmp_path / "restart.sh"
+        script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
+        command = f"printf '%s\\n' safe\n{script}\n"
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd=str(tmp_path)
+        ) is True
 
     def test_absolute_path_binary_does_not_crash_guard(self):
         """#76762: a terminal command invoking a binary by absolute path

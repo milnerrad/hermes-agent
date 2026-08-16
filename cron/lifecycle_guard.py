@@ -155,32 +155,122 @@ _BINARY_SNIFF_BYTES = 4096
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 
+def _iter_single_quote_logical_lines(command: str) -> Iterator[str]:
+    """Yield physical lines joined only across valid single-quoted strings.
+
+    Shell permits literal newlines inside single quotes.  Keeping those lines
+    together lets ``shlex`` retain argument boundaries without changing the
+    guard's established conservative handling of multiline double quotes.
+    """
+    masked = list(command)
+    start = 0
+    single_quoted = False
+    double_quoted = False
+    escaped = False
+    comment = False
+    word_start = True
+
+    for index, char in enumerate(command):
+        if comment:
+            if char == "\n":
+                comment = False
+                word_start = True
+                yield "".join(masked[start : index + 1])
+                start = index + 1
+            else:
+                masked[index] = " "
+            continue
+        if single_quoted:
+            if char == "'":
+                single_quoted = False
+            continue
+        if escaped:
+            escaped = False
+            word_start = False
+            continue
+        if char == "\\":
+            escaped = True
+            word_start = False
+            continue
+        if double_quoted:
+            if char == '"':
+                double_quoted = False
+            if char == "\n":
+                # Preserve the historical line-wise fallback for multiline
+                # double quotes, whose contents can execute substitutions.
+                yield "".join(masked[start : index + 1])
+                start = index + 1
+            continue
+        if char == "#" and word_start:
+            comment = True
+            masked[index] = " "
+            continue
+        if char == "'":
+            single_quoted = True
+            word_start = False
+            continue
+        if char == '"':
+            double_quoted = True
+            word_start = False
+            continue
+        if char == "\n":
+            yield "".join(masked[start : index + 1])
+            start = index + 1
+            word_start = True
+            continue
+        if char.isspace() or char in _CONTROL_CHARS:
+            word_start = True
+        else:
+            word_start = False
+
+    if start < len(command):
+        yield "".join(masked[start:])
+
+
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield shell-tokenized command segments, honoring quotes and comments."""
     normalized = command.replace("\\\n", "")
-    for line in normalized.splitlines() or [normalized]:
+    for logical_line in _iter_single_quote_logical_lines(normalized):
+        physical_lines = logical_line.splitlines() or [logical_line]
         try:
             lexer = shlex.shlex(
-                line,
+                logical_line,
                 posix=True,
                 punctuation_chars=";&|()",
             )
             lexer.whitespace_split = True
-            lexer.commenters = "#"
-            tokens = list(lexer)
+            # Real shell comments were masked by the logical-line pass.  A
+            # hash inside a word (``tag#literal``) remains ordinary data.
+            lexer.commenters = ""
+            token_batches = [list(lexer)]
         except ValueError:
-            continue
+            # Malformed quoting remains conservative: retain the previous
+            # best-effort scan of each physical line in the failed chunk.
+            token_batches = []
+            for line in physical_lines:
+                try:
+                    lexer = shlex.shlex(
+                        line,
+                        posix=True,
+                        punctuation_chars=";&|()",
+                    )
+                    lexer.whitespace_split = True
+                    lexer.commenters = ""
+                    token_batches.append(list(lexer))
+                except ValueError:
+                    continue
 
-        segment: list[str] = []
-        for token in tokens:
-            if token and set(token) <= _CONTROL_CHARS:
-                if segment:
-                    yield segment
-                    segment = []
-                continue
-            segment.append(token)
-        if segment:
-            yield segment
+        for tokens in token_batches:
+            segment: list[str] = []
+            for token in tokens:
+                if token and set(token) <= _CONTROL_CHARS:
+                    if segment:
+                        yield segment
+                        segment = []
+                    continue
+                segment.append(token)
+            if segment:
+                yield segment
 
 
 def _command_token_index(segment: list[str]) -> Optional[int]:
@@ -216,6 +306,65 @@ def _heredoc_receiver(fragment: str) -> Optional[str]:
     return receiver
 
 
+def _mask_inert_shell_text(text: str) -> str:
+    """Neutralize quoted text and comments before shell-syntax regexes.
+
+    Quote contents become ``x`` rather than whitespace so a quoted argument
+    still occupies one token (important for ``hash -p '/path' name``).  Newline
+    positions are retained for command-boundary-aware patterns.
+    """
+    masked = list(text)
+    quote: Optional[str] = None
+    escaped = False
+    comment = False
+    word_start = True
+
+    for index, char in enumerate(text):
+        if comment:
+            if char == "\n":
+                comment = False
+                word_start = True
+            else:
+                masked[index] = " "
+            continue
+        if quote is not None:
+            if char == "\n":
+                continue
+            masked[index] = "x"
+            if quote == '"' and escaped:
+                escaped = False
+                continue
+            if quote == '"' and char == "\\":
+                escaped = True
+                continue
+            if char == quote:
+                quote = None
+            continue
+        if escaped:
+            escaped = False
+            word_start = False
+            continue
+        if char == "\\":
+            escaped = True
+            word_start = False
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            word_start = False
+            masked[index] = "x"
+            continue
+        if char == "#" and word_start:
+            comment = True
+            masked[index] = " "
+            continue
+        if char == "\n" or char.isspace() or char in _CONTROL_CHARS:
+            word_start = True
+        else:
+            word_start = False
+
+    return "".join(masked)
+
+
 def _heredoc_receiver_is_overridden(prefix: str, receiver: Optional[str]) -> bool:
     """Return whether earlier syntax overrides a plain receiver command.
 
@@ -225,12 +374,13 @@ def _heredoc_receiver_is_overridden(prefix: str, receiver: Optional[str]) -> boo
     """
     if not receiver or "/" in receiver:
         return True
+    syntax = _mask_inert_shell_text(prefix)
     name = re.escape(receiver)
     function_pattern = re.compile(
         rf"(?:^|[;&|\n]\s*)(?:"
         rf"function\s+{name}(?:\s*\(\s*\))?"
         rf"|{name}\s*\(\s*\)"
-        rf")\s*\{{"
+        rf")(?=\s|$)"
     )
     alias_pattern = re.compile(
         rf"(?:^|[;&|\n]\s*)alias\s+{name}\s*="
@@ -245,11 +395,11 @@ def _heredoc_receiver_is_overridden(prefix: str, receiver: Optional[str]) -> boo
         r"(?:^|[;&|\n]\s*)(?:(?:source|\.)\s+|eval(?:\s|$))"
     )
     return bool(
-        function_pattern.search(prefix)
-        or alias_pattern.search(prefix)
-        or path_assignment_pattern.search(prefix)
-        or hash_override_pattern.search(prefix)
-        or dynamic_shell_state_pattern.search(prefix)
+        function_pattern.search(syntax)
+        or alias_pattern.search(syntax)
+        or path_assignment_pattern.search(syntax)
+        or hash_override_pattern.search(syntax)
+        or dynamic_shell_state_pattern.search(syntax)
     )
 
 
