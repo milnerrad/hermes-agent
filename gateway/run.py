@@ -23890,6 +23890,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata.setdefault("scope_id", str(team_id))
                 if user_id:
                     metadata.setdefault("user_id", str(user_id))
+        thread_id = getattr(source, "thread_id", None)
+        if (
+            getattr(source, "platform", None) == Platform.TELEGRAM
+            and isinstance(thread_id, str)
+            and thread_id.startswith("guest:")
+        ):
+            metadata = dict(metadata or {})
+            metadata["telegram_guest_query_id"] = thread_id.removeprefix("guest:")
         return metadata
 
     def _thread_metadata_for_target(
