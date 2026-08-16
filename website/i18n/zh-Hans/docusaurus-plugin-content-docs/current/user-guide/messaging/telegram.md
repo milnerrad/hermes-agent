@@ -894,9 +894,10 @@ gateway:
     telegram:
       extra:
         rich_messages: true
+        rich_all_markdown: false
 ```
 
-这个设置用于客户端渲染/复制兼容性；当 Telegram 拒绝富消息 API 调用时，Hermes 已经会自动回退。如果你只是想在保持富消息启用的同时恢复旧版「始终使用代码块」表格行为，可在 `config.yaml` 中设置 `telegram.pretty_tables: false` 禁用表格规范化（默认：`true`）。
+这个设置用于客户端渲染/复制兼容性；当 Telegram 拒绝富消息 API 调用时，Hermes 已经会自动回退。如果你还想让普通 markdown（标题、粗体/斜体、简单列表）也使用 Telegram 富消息渲染器而不是 MarkdownV2 路径，请设置 `rich_all_markdown: true`。如果你只是想在保持富消息启用的同时恢复旧版「始终使用代码块」表格行为，可在 `config.yaml` 中设置 `telegram.pretty_tables: false` 禁用表格规范化（默认：`true`）。
 
 **链接预览。** Telegram 会为机器人消息中的 URL 自动生成链接预览。如果你希望抑制这些预览（长 `/tools` 输出、提及十个链接的 Agent 回复等）：
 
@@ -988,6 +989,29 @@ TELEGRAM_GUEST_MODE=true
 启用 `guest_mode: true` 后，来自非白名单群组的消息**仅在**明确 @mention 机器人时才被处理。每轮都需要提及——访客交互没有会话粘性，因此机器人永远不会在未被 ping 的朋友群组线程中自动参与。
 
 私聊和白名单群组的行为与之前完全相同。
+
+### Bot API 访客查询（`allow_guest_queries`）
+
+Telegram Bot API 访客查询允许用户在机器人可能不是成员的聊天中调用机器人。它与上面的 `guest_mode` @mention 绕过是不同的功能和信任边界。即使已安装的 `python-telegram-bot` 版本支持访客查询，该功能也**默认关闭**。
+
+```yaml
+gateway:
+  platforms:
+    telegram:
+      extra:
+        allow_guest_queries: true
+        guest_query_rate_limit_per_minute: 5
+```
+
+启用后：
+
+- 访客查询仍须通过已配置的 Telegram 用户授权以及聊天、主题、自身消息和触发条件关卡。
+- 默认情况下，每个发送者/聊天组合每分钟最多接受 5 个查询（可配置为 1–60）。内存状态有界，并会去重重复的 `guest_query_id`。
+- 每个查询使用隔离的一次性会话通道，并只通过 `answerGuestQuery` 返回一个文本答案。流式输出、输入状态、进度更新、媒体/文件传送和 TTS 均被禁用；空响应和不受支持的媒体/位置查询会收到一个明确的终止文本答复。
+- 一次性传输无法承载交互式澄清或审批按钮。澄清请求会将控制权交还给代理，使其采用安全假设或说明缺少的信息；需要交互式命令审批的操作会被自动拒绝。
+- **其他工具信任保持不变：**通过授权的访客查询使用与普通 Telegram 回合相同的代理和工具集，但会阻止跨频道 `send_message` 工具，以保留一次性传送边界。会话隔离并不等于全面的低权限工具沙箱；仅应为你信任其使用其余工具及其副作用的用户和聊天范围启用此功能。
+
+等效启用环境变量：`TELEGRAM_ALLOW_GUEST_QUERIES=true`。现有 `guest_mode` 不会启用 Bot API 访客查询。
 
 ## 斜杠命令访问控制
 
