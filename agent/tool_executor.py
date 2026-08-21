@@ -18,6 +18,7 @@ from pathlib import Path
 import logging
 import os
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ from agent.tool_dispatch_helpers import (
     make_tool_result_message,
 )
 from agent.tool_argument_integrity import (
+    INCOMPLETE_TOOL_ARGUMENTS_KEY,
     incomplete_tool_arguments_after_schema_decode as _incomplete_after_schema_decode,
     incomplete_tool_arguments_error_result as _incomplete_tool_arguments_error_result,
     is_incomplete_tool_arguments_error_result as _is_incomplete_tool_arguments_error_result,
@@ -58,6 +60,14 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+_INCOMPLETE_KEY_ESCAPE_RE = re.compile(
+    "".join(
+        rf"(?:{re.escape(char)}|\\+u00{ord(char):02x})"
+        for char in INCOMPLETE_TOOL_ARGUMENTS_KEY
+    ),
+    re.IGNORECASE,
+)
 
 
 def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -> None:
@@ -206,6 +216,18 @@ def _schema_decoded_integrity_result(
     except Exception:
         pass
     return _incomplete_after_schema_decode(preview_args, parameters)
+
+
+def _may_contain_incomplete_provenance(value: Any) -> bool:
+    """Cheap gate for literal or JSON-escaped reserved provenance keys."""
+    if isinstance(value, str):
+        serialized = value
+    else:
+        try:
+            serialized = json.dumps(value, ensure_ascii=True)
+        except (TypeError, ValueError):
+            return False
+    return _INCOMPLETE_KEY_ESCAPE_RE.search(serialized) is not None
 
 
 def _resolve_concurrent_tool_timeout() -> float | None:
@@ -1181,7 +1203,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        if _ts_scope_block is None:
+        if _ts_scope_block is None and _may_contain_incomplete_provenance(
+            function_args
+        ):
             _schema_integrity_result = _schema_decoded_integrity_result(
                 function_name, function_args
             )
@@ -2142,7 +2166,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        if _ts_scope_block is None:
+        if _ts_scope_block is None and _may_contain_incomplete_provenance(
+            function_args
+        ):
             _schema_integrity_result = _schema_decoded_integrity_result(
                 function_name, function_args
             )
