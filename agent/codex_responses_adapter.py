@@ -478,6 +478,11 @@ def _chat_messages_to_responses_input(
     local history is never truncated by native compaction, so the full
     conversation is still on the wire.
     """
+    from agent.tool_argument_integrity import (
+        neutralize_completed_incomplete_tool_calls,
+    )
+
+    messages = neutralize_completed_incomplete_tool_calls(messages)
     items: List[Dict[str, Any]] = []
     seen_item_ids: set = set()
 
