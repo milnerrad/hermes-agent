@@ -131,6 +131,36 @@ def test_schema_decoded_rejection_skips_lifecycle(agent, monkeypatch, concurrent
 
 
 @pytest.mark.parametrize("concurrent", [False, True])
+def test_escaped_schema_decoded_marker_skips_lifecycle(agent, monkeypatch, concurrent):
+    from tools.registry import registry
+
+    events = []
+    tool_name = "integrity_escaped_schema_lifecycle_probe"
+    registry.register(
+        name=tool_name,
+        toolset="integrity-lifecycle",
+        schema={
+            "name": tool_name,
+            "description": "probe",
+            "parameters": {
+                "type": "object",
+                "properties": {"items": {"type": "array"}},
+            },
+        },
+        handler=lambda args, **kwargs: events.append("handler") or "handled",
+    )
+    encoded = '[{"__hermes_incomplete_tool_argument\\u0073__":{"version":1}}]'
+    raw_arguments = json.dumps({"items": encoded})
+    assert RESERVED not in raw_arguments
+    call = _mock_tool_call(name=tool_name, arguments=raw_arguments, call_id="escaped")
+    messages = []
+    with patch("run_agent.handle_function_call", side_effect=AssertionError("dispatch")):
+        _run(agent, concurrent, call, messages)
+    assert events == []
+    assert json.loads(messages[0]["content"])["error_type"] == "incomplete_historical_tool_arguments"
+
+
+@pytest.mark.parametrize("concurrent", [False, True])
 def test_preexisting_interrupt_still_rejects_integrity_before_hooks(
     agent, monkeypatch, concurrent
 ):
