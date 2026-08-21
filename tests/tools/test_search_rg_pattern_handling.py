@@ -84,6 +84,24 @@ def test_invalid_regex_preserves_normal_error_without_pcre2_retry(corpus, monkey
     assert "--pcre2" not in commands[0]
 
 
+def test_trigger_phrase_inside_pattern_does_not_enable_pcre2(corpus, monkeypatch):
+    ops = _ops(corpus)
+    commands = []
+    original = ops._exec
+
+    def capture(command, *args, **kwargs):
+        commands.append(command)
+        return original(command, *args, **kwargs)
+
+    monkeypatch.setattr(ops, "_exec", capture)
+    pattern = r"(?P<x>a)(?P=x)(?# backreferences are not supported)"
+    result = _rg(ops, pattern, corpus)
+
+    assert result.error is not None
+    assert len(commands) == 1
+    assert "--pcre2" not in commands[0]
+
+
 def test_pcre2_retry_preserves_glob_context_and_path(corpus):
     result = _rg(
         _ops(corpus),
