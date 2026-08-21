@@ -419,10 +419,19 @@ def _rg_diagnostic_requires_pcre2(diagnostics: str) -> bool:
         "error: look-around, including look-ahead and look-behind, is not supported",
         "error: backreferences are not supported",
     }
-    return any(
-        line.rstrip().lower() in supported_errors
-        for line in diagnostics.splitlines()
-    )
+    lines = [line.rstrip().lower() for line in diagnostics.splitlines()]
+    nonempty = [line for line in lines if line]
+    if not nonempty or nonempty[0] != "rg: regex parse error:":
+        return False
+    # Anchor the trigger inside rg's complete parser diagnostic. User-controlled
+    # patterns are indented, while path/I/O diagnostics end with their OS error
+    # rather than rg's fixed PCRE2 recommendation.
+    if nonempty[-2:] != [
+        "consider enabling pcre2 with the --pcre2 flag, which can handle backreferences",
+        "and look-around.",
+    ]:
+        return False
+    return any(line in supported_errors for line in nonempty[1:-2])
 
 
 # A real rg/grep output line starts with a path token and is followed by a
