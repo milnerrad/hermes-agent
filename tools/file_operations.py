@@ -413,6 +413,16 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
     return '\n'.join(diagnostics), '\n'.join(payload)
 
 
+def _rg_diagnostic_requires_pcre2(diagnostics: str) -> bool:
+    """Whether Rust-regex rejected a construct that PCRE2 supports."""
+    lowered = diagnostics.lower()
+    return (
+        "look-around, including look-ahead and look-behind, is not supported"
+        in lowered
+        or "backreferences are not supported" in lowered
+    )
+
+
 # A real rg/grep output line starts with a path token and is followed by a
 # ``:`` (match/count), a ``-`` (context), or nothing (files_only). Tool
 # diagnostics ("rg: ...", "grep: ...", "error: ...", indented carets) never
@@ -3212,6 +3222,21 @@ class ShellFileOperations(FileOperations):
         # are interleaved with match output. Split them out: diagnostics must
         # not be parsed as matches, and on a hard error they ARE the message.
         diagnostics, payload = _split_tool_diagnostics(stdout)
+
+        # Rust regex intentionally excludes look-around and backreferences.
+        # Retry exactly once with PCRE2 only when rg's diagnostic names one of
+        # those constructs; unrelated parse errors retain the normal path.
+        if (
+            result.exit_code == 2
+            and not payload.strip()
+            and _rg_diagnostic_requires_pcre2(diagnostics)
+        ):
+            pcre_cmd_parts = list(cmd_parts)
+            pcre_cmd_parts.insert(1, "--pcre2")
+            pcre_cmd = "set -o pipefail; " + " ".join(pcre_cmd_parts)
+            result = self._exec(pcre_cmd, timeout=60)
+            stdout, limit_reason = _search_stdout_and_limit(result)
+            diagnostics, payload = _split_tool_diagnostics(stdout)
 
         # rg exit codes: 0=matches found, 1=no matches, 2=error. rg returns 2
         # even on partial errors (e.g. one unreadable file in a tree that
