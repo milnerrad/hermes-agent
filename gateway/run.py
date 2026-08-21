@@ -22234,6 +22234,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not response or response.startswith("Error:"):
             return False
+        if (
+            event.source.platform == Platform.TELEGRAM
+            and isinstance(event.source.thread_id, str)
+            and event.source.thread_id.startswith("guest:")
+        ):
+            return False
 
         chat_id = event.source.chat_id
         voice_key = self._voice_key(event.source.platform, chat_id)
@@ -22592,6 +22598,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         resolve from that profile's secret scope. Mirrors the pattern in
         ``_run_agent``.
         """
+        from gateway.session_context import declare_stateless_channel
+
+        # A /background task owns a finite agent turn. Late detached children
+        # cannot route back through this copied context after it returns.
+        declare_stateless_channel()
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
