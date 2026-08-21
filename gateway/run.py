@@ -5445,8 +5445,16 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        _is_telegram_guest_query = bool(
+            (ctx._status_thread_metadata or {}).get("telegram_guest_query_id")
+        )
+        if _is_telegram_guest_query:
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = ctx.interim_assistant_messages_enabled
+        _want_interim_messages = (
+            ctx.interim_assistant_messages_enabled
+            and not _is_telegram_guest_query
+        )
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -27716,6 +27724,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
+        _is_telegram_guest_query = bool(
+            (_thread_metadata or {}).get("telegram_guest_query_id")
+        )
+        if _is_telegram_guest_query:
+            _streaming_enabled = False
 
         if _streaming_enabled:
             try:
@@ -27745,9 +27758,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _stream_consumer:
             stream_task = asyncio.create_task(_stream_consumer.run())
 
-        # Send typing indicator
+        # Telegram Business guest queries must receive exactly one answer via
+        # answerBusinessConnectionQuery. Typing actions are unrelated Bot API
+        # calls and are intentionally skipped for this one-shot lane.
         _adapter = self._adapter_for_source(source)
-        if _adapter:
+        if _adapter and not _is_telegram_guest_query:
             try:
                 await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
             except Exception:
