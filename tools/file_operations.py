@@ -420,7 +420,7 @@ def _rg_diagnostic_requires_pcre2(diagnostics: str) -> bool:
         "error: backreferences are not supported",
     }
     return any(
-        line.strip().lower() in supported_errors
+        line.rstrip().lower() in supported_errors
         for line in diagnostics.splitlines()
     )
 
