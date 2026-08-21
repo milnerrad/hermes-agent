@@ -4,7 +4,10 @@ import shutil
 
 import pytest
 
-from tools.file_operations import ShellFileOperations
+from tools.file_operations import (
+    ShellFileOperations,
+    _rg_diagnostic_requires_pcre2,
+)
 from tools.environments.local import LocalEnvironment
 
 pytestmark = pytest.mark.skipif(shutil.which("rg") is None, reason="requires ripgrep")
@@ -100,6 +103,15 @@ def test_trigger_phrase_inside_pattern_does_not_enable_pcre2(corpus, monkeypatch
     assert result.error is not None
     assert len(commands) == 1
     assert "--pcre2" not in commands[0]
+
+
+def test_indented_echoed_error_line_does_not_enable_pcre2():
+    diagnostic = (
+        "rg: regex parse error:\n"
+        "    error: backreferences are not supported\n"
+        "error: unclosed character class"
+    )
+    assert not _rg_diagnostic_requires_pcre2(diagnostic)
 
 
 def test_pcre2_retry_preserves_glob_context_and_path(corpus):
