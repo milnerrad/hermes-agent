@@ -114,6 +114,33 @@ def test_indented_echoed_error_line_does_not_enable_pcre2():
     assert not _rg_diagnostic_requires_pcre2(diagnostic)
 
 
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        "error: backreferences are not supported",
+        "error: look-around, including look-ahead and look-behind, is not supported",
+    ],
+)
+def test_trigger_phrase_in_multiline_missing_path_does_not_enable_pcre2(
+    corpus, monkeypatch, trigger
+):
+    ops = _ops(corpus)
+    commands = []
+    original = ops._exec
+
+    def capture(command, *args, **kwargs):
+        commands.append(command)
+        return original(command, *args, **kwargs)
+
+    monkeypatch.setattr(ops, "_exec", capture)
+    missing = corpus / f"prefix\n{trigger}\nsuffix"
+    result = _rg(ops, "alpha", missing)
+
+    assert result.error is not None
+    assert len(commands) == 1
+    assert "--pcre2" not in commands[0]
+
+
 def test_pcre2_retry_preserves_glob_context_and_path(corpus):
     result = _rg(
         _ops(corpus),
