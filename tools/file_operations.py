@@ -414,12 +414,14 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
 
 
 def _rg_diagnostic_requires_pcre2(diagnostics: str) -> bool:
-    """Whether Rust-regex rejected a construct that PCRE2 supports."""
-    lowered = diagnostics.lower()
-    return (
-        "look-around, including look-ahead and look-behind, is not supported"
-        in lowered
-        or "backreferences are not supported" in lowered
+    """Whether rg's actual error line names a PCRE2-only construct."""
+    supported_errors = {
+        "error: look-around, including look-ahead and look-behind, is not supported",
+        "error: backreferences are not supported",
+    }
+    return any(
+        line.strip().lower() in supported_errors
+        for line in diagnostics.splitlines()
     )
 
 
