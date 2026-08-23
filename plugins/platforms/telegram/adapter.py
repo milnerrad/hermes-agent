@@ -5237,31 +5237,6 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
-        guest_query_id = (metadata or {}).get("telegram_guest_query_id")
-        if guest_query_id:
-            # Guest Mode permits exactly one answer per query. Suppress status /
-            # streaming sends and reserve answerGuestQuery for the final reply.
-            if not (metadata or {}).get("notify"):
-                return SendResult(success=True, message_id=None)
-            try:
-                formatted = self.format_message(content.strip())
-                result = InlineQueryResultArticle(
-                    id=str(guest_query_id),
-                    title="Response",
-                    input_message_content=InputTextMessageContent(
-                        formatted,
-                        parse_mode=ParseMode.MARKDOWN_V2,
-                    ),
-                )
-                sent = await self._bot.answer_guest_query(str(guest_query_id), result)
-                return SendResult(
-                    success=True,
-                    message_id=str(getattr(sent, "message_id", "")) or None,
-                )
-            except Exception as exc:
-                logger.exception("[%s] Failed to answer Telegram guest query", self.name)
-                return SendResult(success=False, error=str(exc), retryable=False)
-
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
             return SendResult(success=False, error="send_path_degraded", retryable=True)
