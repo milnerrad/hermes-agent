@@ -1664,7 +1664,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _message_thread_id_for_send(cls, thread_id: Optional[str]) -> Optional[int]:
         if not thread_id or str(thread_id) == cls._GENERAL_TOPIC_THREAD_ID:
             return None
-        return cls._numeric_message_thread_id(thread_id)
+        return int(thread_id)
 
     @classmethod
     def _message_thread_id_for_typing(cls, thread_id: Optional[str]) -> Optional[int]:
@@ -1677,7 +1677,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # sends still map "1" → None via _message_thread_id_for_send.
         if not thread_id:
             return None
-        return cls._numeric_message_thread_id(thread_id)
+        return int(thread_id)
 
     @staticmethod
     def _is_thread_not_found_error(error: Exception) -> bool:
