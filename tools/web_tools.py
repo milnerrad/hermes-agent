@@ -359,6 +359,100 @@ def _get_capability_backend(capability: str) -> str:
     return _get_backend()
 
 
+def _get_fallback_backend(capability: str) -> str:
+    """Return the configured request-level fallback for *capability*.
+
+    A capability-specific value wins over the shared fallback. Unlike
+    ``web.backend`` (a selection default), this backend is attempted only
+    after the selected primary provider fails a request.
+    """
+    cfg = _load_web_config()
+    return (
+        (cfg.get(f"{capability}_fallback_backend") or cfg.get("fallback_backend") or "")
+        .lower()
+        .strip()
+    )
+
+
+def _get_secondary_provider(primary_name: str, capability: str):
+    """Resolve a configured, distinct provider that supports *capability*."""
+    name = _get_fallback_backend(capability)
+    if not name or name == primary_name:
+        return None
+    try:
+        from agent.web_search_registry import get_provider
+
+        provider = get_provider(name)
+        supports = getattr(provider, f"supports_{capability}", None)
+        if provider is None or not callable(supports) or not supports():
+            logger.warning(
+                "web.%s_fallback_backend '%s' is unavailable or unsupported",
+                capability,
+                name,
+            )
+            return None
+        try:
+            from plugins.web.keyless_mcp import provider_tier
+
+            if provider_tier(name) == "free":
+                logger.warning(
+                    "Configured web.%s fallback '%s' is pinned to the keyless tier; skipping it",
+                    capability,
+                    name,
+                )
+                return None
+            if not provider.is_available():
+                logger.warning(
+                    "Configured web.%s fallback '%s' is unavailable in its configured mode; skipping it",
+                    capability,
+                    name,
+                )
+                return None
+        except Exception as exc:  # noqa: BLE001 — unavailable secondary is non-fatal
+            logger.warning(
+                "Configured web.%s fallback '%s' availability check failed: %s",
+                capability,
+                name,
+                exc,
+            )
+            return None
+        return provider
+    except Exception as exc:  # noqa: BLE001 — fallback is best-effort
+        logger.warning("web %s fallback '%s' could not load: %s", capability, name, exc)
+        return None
+
+
+def _try_fallback_search(
+    primary_name: str, original_error: str, query: str, limit: int
+) -> tuple[dict | None, str]:
+    """Try the configured secondary search provider once.
+
+    Returns ``(successful_result, fallback_error)``. A missing or invalid
+    secondary is represented by ``(None, "")`` so the existing keyless rescue
+    can still run unchanged.
+    """
+    provider = _get_secondary_provider(primary_name, "search")
+    if provider is None:
+        return None, ""
+    logger.warning(
+        "web_search backend '%s' failed (%s); trying configured fallback '%s'",
+        primary_name,
+        (original_error or "")[:200],
+        provider.name,
+    )
+    try:
+        result = provider.search(query, limit)
+    except Exception as exc:  # noqa: BLE001 — continue to keyless rescue
+        return None, str(exc)
+    if not result.get("success"):
+        return None, str(result.get("error", "search failed"))
+    data = result.setdefault("data", {})
+    data["served_by"] = provider.name
+    data["fallback_from"] = primary_name
+    data["backend_error"] = (original_error or "unknown error")[:300]
+    return result, ""
+
+
 def _tavily_explicitly_configured() -> bool:
     cfg = _load_web_config()
     return any(
@@ -530,6 +624,98 @@ def _policy_blocked_result(result: dict) -> bool:
     return "blocked by website policy" in str(result.get("error") or "").lower()
 
 
+async def _try_fallback_extract(
+    primary_name: str, urls: list, results: list, *, format: str | None = None
+) -> tuple[list | None, str]:
+    """Try the configured secondary extract provider for genuine failures.
+
+    Policy-blocked URLs are never sent to another provider. A secondary that
+    fails the whole retry returns ``None`` so the existing keyless rescue can
+    still run.
+    """
+    provider = _get_secondary_provider(primary_name, "extract")
+    if provider is None:
+        return None, ""
+
+    if len(results) == len(urls):
+        retry_indices = [
+            i for i, result in enumerate(results) if not _policy_blocked_result(result)
+        ]
+    elif any(_policy_blocked_result(result) for result in results):
+        # A malformed provider response cannot be mapped safely back to every
+        # input URL. Refuse the fallback rather than risk re-fetching a URL
+        # whose corresponding result says the user's policy blocked it.
+        return None, ""
+    else:
+        retry_indices = list(range(len(urls)))
+    if not retry_indices:
+        return None, ""
+
+    retry_urls = [urls[i] for i in retry_indices]
+    original_error = next(
+        (
+            results[i].get("error")
+            for i in retry_indices
+            if i < len(results) and results[i].get("error")
+        ),
+        "extract failed",
+    )
+    logger.warning(
+        "web_extract backend '%s' failed (%s); trying configured fallback '%s'",
+        primary_name,
+        (original_error or "")[:200],
+        provider.name,
+    )
+
+    import inspect
+
+    try:
+        if inspect.iscoroutinefunction(provider.extract):
+            retried = await provider.extract(retry_urls, format=format)
+        else:
+            retried = await asyncio.to_thread(
+                provider.extract, retry_urls, format=format
+            )
+    except Exception as exc:  # noqa: BLE001 — continue to keyless rescue
+        return None, str(exc)
+
+    for result in retried:
+        if not result.get("error"):
+            metadata = result.setdefault("metadata", {})
+            metadata["served_by"] = provider.name
+            metadata["fallback_from"] = primary_name
+            metadata["backend_error"] = (original_error or "unknown error")[:300]
+
+    # A secondary may discover a redirect-time website-policy refusal that the
+    # primary did not see. Preserve that result so the later keyless rescue can
+    # exclude it instead of losing the policy signal and fetching the URL.
+    if retried and any(_policy_blocked_result(result) for result in retried):
+        if len(results) == len(urls) and len(retried) == len(retry_indices):
+            merged = list(results)
+            for position, index in enumerate(retry_indices):
+                merged[index] = retried[position]
+            return merged, ""
+        return retried, ""
+
+    if not retried or all(result.get("error") for result in retried):
+        fallback_error = (
+            next(
+                (result.get("error") for result in retried if result.get("error")),
+                "extract failed",
+            )
+            if retried
+            else "extract returned no results"
+        )
+        return None, str(fallback_error)
+
+    if len(results) == len(urls) and len(retried) == len(retry_indices):
+        merged = list(results)
+        for position, index in enumerate(retry_indices):
+            merged[index] = retried[position]
+        return merged, ""
+    return retried, ""
+
+
 def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
     """One-shot keyless-ring rescue for a failed keyed/configured extract.
 
@@ -546,6 +732,10 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
     # Partition out policy blocks. Rescue only genuine backend failures.
     if len(results) == len(urls):
         rescue_idx = [i for i, r in enumerate(results) if not _policy_blocked_result(r)]
+    elif any(_policy_blocked_result(result) for result in results):
+        # With broken order parity, policy-blocked results cannot be mapped
+        # safely to all input URLs. Suppress rescue rather than bypass policy.
+        return results
     else:  # defensive: provider broke order parity — treat all as rescueable
         rescue_idx = list(range(len(results)))
     if not rescue_idx:
@@ -968,25 +1158,45 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             try:
                 response_data = provider.search(query, limit)
             except Exception as exc:  # noqa: BLE001 — candidate for rescue
-                if _rescue_eligible(provider):
+                original_error = str(exc)
+                fallback_result, fallback_error = _try_fallback_search(
+                    provider.name, original_error, query, limit
+                )
+                if fallback_result is not None:
+                    response_data = fallback_result
+                elif _rescue_eligible(provider):
+                    rescue_error = original_error
+                    if fallback_error:
+                        rescue_error += (
+                            f"; configured fallback '{_get_fallback_backend('search')}' "
+                            f"also failed ({fallback_error[:200]})"
+                        )
                     response_data = _rescue_search(
-                        provider.name, str(exc), query, limit
+                        provider.name, rescue_error, query, limit
                     )
                 else:
                     raise
             else:
-                if (
-                    not response_data.get("success")
-                    and _rescue_eligible(provider)
-                ):
-                    # One-shot keyless rescue: THIS call rides the free-tier
-                    # ring; the next call attempts the chosen backend again.
-                    response_data = _rescue_search(
-                        provider.name,
-                        str(response_data.get("error", "")),
-                        query,
-                        limit,
+                if not response_data.get("success"):
+                    original_error = str(response_data.get("error", ""))
+                    fallback_result, fallback_error = _try_fallback_search(
+                        provider.name, original_error, query, limit
                     )
+                    if fallback_result is not None:
+                        response_data = fallback_result
+                    elif _rescue_eligible(provider):
+                        # One-shot keyless rescue after both configured
+                        # providers failed. The next call starts at the primary.
+                        rescue_error = original_error
+                        if fallback_error:
+                            rescue_error += (
+                                f"; configured fallback "
+                                f"'{_get_fallback_backend('search')}' also failed "
+                                f"({fallback_error[:200]})"
+                            )
+                        response_data = _rescue_search(
+                            provider.name, rescue_error, query, limit
+                        )
 
         debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
         result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
@@ -1239,28 +1449,60 @@ async def web_extract_tool(
                         provider.extract, safe_urls, format=format
                     )
             except Exception as exc:  # noqa: BLE001 — candidate for rescue
-                if _rescue_eligible(provider):
-                    failed = [
-                        {"url": u, "title": "", "content": "", "error": str(exc)}
-                        for u in safe_urls
-                    ]
+                failed = [
+                    {"url": u, "title": "", "content": "", "error": str(exc)}
+                    for u in safe_urls
+                ]
+                fallback_results, fallback_error = await _try_fallback_extract(
+                    provider.name, safe_urls, failed, format=format
+                )
+                if fallback_results is not None:
+                    results = fallback_results
+                elif _rescue_eligible(provider):
+                    if fallback_error:
+                        failed = [
+                            {
+                                **result,
+                                "error": (
+                                    f"{result.get('error', '')}; configured fallback "
+                                    f"'{_get_fallback_backend('extract')}' also failed "
+                                    f"({fallback_error[:200]})"
+                                ),
+                            }
+                            for result in failed
+                        ]
                     results = await asyncio.to_thread(
                         _rescue_extract, provider.name, safe_urls, failed
                     )
                 else:
                     raise
             else:
-                # One-shot keyless rescue when the WHOLE batch failed
-                # (backend-level outage, not per-page problems). Stateless:
-                # the next web_extract call uses the chosen backend again.
-                if (
-                    results
-                    and all(r.get("error") for r in results)
-                    and _rescue_eligible(provider)
-                ):
-                    results = await asyncio.to_thread(
-                        _rescue_extract, provider.name, safe_urls, results
+                # Retry the configured secondary, then the keyless ring, only
+                # when the WHOLE batch failed (backend-level outage rather
+                # than per-page problems). The next call starts at primary.
+                if results and all(r.get("error") for r in results):
+                    fallback_results, fallback_error = await _try_fallback_extract(
+                        provider.name, safe_urls, results, format=format
                     )
+                    if fallback_results is not None:
+                        results = fallback_results
+                    elif _rescue_eligible(provider):
+                        rescue_results = results
+                        if fallback_error:
+                            rescue_results = [
+                                {
+                                    **result,
+                                    "error": (
+                                        f"{result.get('error', '')}; configured fallback "
+                                        f"'{_get_fallback_backend('extract')}' also failed "
+                                        f"({fallback_error[:200]})"
+                                    ),
+                                }
+                                for result in results
+                            ]
+                        results = await asyncio.to_thread(
+                            _rescue_extract, provider.name, safe_urls, rescue_results
+                        )
 
         # Reconstruct the original input order across invalid, blocked, and
         # provider-processed entries. Providers are expected to preserve the
