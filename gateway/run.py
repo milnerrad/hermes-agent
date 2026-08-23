@@ -27942,9 +27942,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _stream_consumer:
             stream_task = asyncio.create_task(_stream_consumer.run())
 
-        # Telegram Business guest queries must receive exactly one answer via
-        # answerBusinessConnectionQuery. Typing actions are unrelated Bot API
-        # calls and are intentionally skipped for this one-shot lane.
         _adapter = self._adapter_for_source(source)
         if _adapter:
             try:

@@ -236,11 +236,6 @@ async def _shutdown_abandoned_app(app) -> None:
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
     try:
-        from telegram import InlineQueryResultArticle, InputTextMessageContent
-    except ImportError:
-        InlineQueryResultArticle = None
-        InputTextMessageContent = None
-    try:
         from telegram import LinkPreviewOptions
     except ImportError:
         LinkPreviewOptions = None
@@ -263,8 +258,6 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
-    InlineQueryResultArticle = Any
-    InputTextMessageContent = Any
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -4326,15 +4319,6 @@ class TelegramAdapter(BasePlatformAdapter):
         ))
         # Handle inline keyboard button callbacks (update prompts)
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
-        if (
-            self._telegram_allow_guest_queries()
-            and TypeHandler is not None
-            and hasattr(Update, "GUEST_MESSAGE")
-            and InlineQueryResultArticle is not None
-            and InputTextMessageContent is not None
-        ):
-            # Guest updates are a fallback after ordinary handlers in group 0.
-            app.add_handler(TypeHandler(Update, self._handle_guest_message), group=1)
         # gateway_platform_event observer (see _on_platform_update); group 99 so
         # it observes alongside, never displaces, the core handlers.
         app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
