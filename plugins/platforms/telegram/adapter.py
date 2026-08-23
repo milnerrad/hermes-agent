@@ -5302,16 +5302,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     ),
                 )
             except Exception as exc:
-                safe_error = _redact_telegram_error_text(exc)
-                # Do not use logger.exception here: exception tracebacks include
-                # the original transport message and can expose the bot token
-                # embedded in Telegram API URLs.
-                logger.error(
-                    "[%s] Failed to answer Telegram guest query: %s",
-                    self.name,
-                    safe_error,
-                )
-                return SendResult(success=False, error=safe_error, retryable=False)
+                logger.exception("[%s] Failed to answer Telegram guest query", self.name)
+                return SendResult(success=False, error=str(exc), retryable=False)
 
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
@@ -6348,11 +6340,6 @@ class TelegramAdapter(BasePlatformAdapter):
         The buttons call ``resolve_gateway_approval()`` to unblock the waiting
         agent thread — same mechanism as the text ``/approve`` flow.
         """
-        if (metadata or {}).get("telegram_guest_query_id"):
-            return SendResult(
-                success=False,
-                error="Interactive approvals are unavailable for Telegram Guest Queries",
-            )
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
@@ -6484,11 +6471,6 @@ class TelegramAdapter(BasePlatformAdapter):
         text — no buttons.  The next message in the session is captured by
         the gateway's text-intercept and resolves the clarify.
         """
-        if (metadata or {}).get("telegram_guest_query_id"):
-            return SendResult(
-                success=False,
-                error="Interactive clarification is unavailable for Telegram Guest Queries",
-            )
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 

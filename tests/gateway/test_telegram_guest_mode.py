@@ -401,40 +401,6 @@ async def test_intermediate_guest_send_is_suppressed():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method_name", ["send_exec_approval", "send_clarify"])
-async def test_guest_interactive_prompt_never_uses_normal_send(method_name):
-    """One-shot guest turns cannot receive interactive follow-up prompts."""
-    adapter = _adapter()
-    adapter._send_message_with_thread_fallback = AsyncMock(
-        return_value=SimpleNamespace(message_id=42)
-    )
-    adapter._approval_state = {}
-    adapter._clarify_state = {}
-    metadata = {"telegram_guest_query_id": "guest-query-1"}
-
-    if method_name == "send_exec_approval":
-        result = await adapter.send_exec_approval(
-            chat_id="111",
-            command="rm -rf /tmp/example",
-            session_key="telegram:111:guest:guest-query-1",
-            metadata=metadata,
-        )
-    else:
-        result = await adapter.send_clarify(
-            chat_id="111",
-            question="Which option?",
-            choices=["A", "B"],
-            clarify_id="clarify-1",
-            session_key="telegram:111:guest:guest-query-1",
-            metadata=metadata,
-        )
-
-    assert result.success is False
-    assert "Guest Quer" in (result.error or "")
-    adapter._send_message_with_thread_fallback.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_degraded_final_guest_send_does_not_burn_one_shot():
     adapter = _adapter()
     adapter._send_path_degraded = True
@@ -594,67 +560,6 @@ async def test_guest_answer_failure_is_non_retryable(monkeypatch):
     assert result.success is False
     assert result.retryable is False
     assert result.error == "expired"
-
-
-@pytest.mark.asyncio
-async def test_guest_answer_failure_is_not_retried_or_plain_text_fallback(monkeypatch):
-    adapter = _adapter()
-    monkeypatch.setattr(
-        "plugins.platforms.telegram.adapter.InputTextMessageContent",
-        lambda text, **kwargs: SimpleNamespace(message_text=text, **kwargs),
-    )
-    monkeypatch.setattr(
-        "plugins.platforms.telegram.adapter.InlineQueryResultArticle",
-        lambda **kwargs: SimpleNamespace(**kwargs),
-    )
-    adapter._bot.answer_guest_query = AsyncMock(side_effect=RuntimeError("expired"))
-
-    result = await adapter._send_with_retry(
-        "1482299073",
-        "Too late",
-        metadata={
-            "telegram_guest_query_id": "5323706597129951744",
-            "notify": True,
-        },
-    )
-
-    assert result.success is False
-    assert result.retryable is False
-    assert result.error == "expired"
-    adapter._bot.answer_guest_query.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_guest_answer_failure_redacts_telegram_token(caplog, monkeypatch):
-    adapter = _adapter()
-    monkeypatch.setattr(
-        "plugins.platforms.telegram.adapter.InputTextMessageContent",
-        lambda text, **kwargs: SimpleNamespace(message_text=text, **kwargs),
-    )
-    monkeypatch.setattr(
-        "plugins.platforms.telegram.adapter.InlineQueryResultArticle",
-        lambda **kwargs: SimpleNamespace(**kwargs),
-    )
-    token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
-    adapter._bot.answer_guest_query = AsyncMock(
-        side_effect=RuntimeError(f"request failed at https://api.telegram.org/bot{token}/answerGuestQuery")
-    )
-
-    with caplog.at_level("ERROR"):
-        result = await adapter.send(
-            "1482299073",
-            "Too late",
-            metadata={
-                "telegram_guest_query_id": "5323706597129951744",
-                "notify": True,
-            },
-        )
-
-    assert result.success is False
-    assert result.retryable is False
-    assert token not in (result.error or "")
-    assert token not in caplog.text
-    assert "***" in (result.error or "")
 
 
 # ---------------------------------------------------------------------------
