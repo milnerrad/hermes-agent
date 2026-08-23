@@ -5449,16 +5449,8 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
-        _is_telegram_guest_query = bool(
-            (ctx._status_thread_metadata or {}).get("telegram_guest_query_id")
-        )
-        if _is_telegram_guest_query:
-            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = (
-            ctx.interim_assistant_messages_enabled
-            and not _is_telegram_guest_query
-        )
+        _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -22242,12 +22234,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not response or response.startswith("Error:"):
             return False
-        if (
-            event.source.platform == Platform.TELEGRAM
-            and isinstance(event.source.thread_id, str)
-            and event.source.thread_id.startswith("guest:")
-        ):
-            return False
 
         chat_id = event.source.chat_id
         voice_key = self._voice_key(event.source.platform, chat_id)
@@ -23909,14 +23895,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata.setdefault("scope_id", str(team_id))
                 if user_id:
                     metadata.setdefault("user_id", str(user_id))
-        thread_id = getattr(source, "thread_id", None)
-        if (
-            getattr(source, "platform", None) == Platform.TELEGRAM
-            and isinstance(thread_id, str)
-            and thread_id.startswith("guest:")
-        ):
-            metadata = dict(metadata or {})
-            metadata["telegram_guest_query_id"] = thread_id.removeprefix("guest:")
         return metadata
 
     def _thread_metadata_for_target(
@@ -27936,12 +27914,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
-        _is_telegram_guest_query = bool(
-            (_thread_metadata or {}).get("telegram_guest_query_id")
-        )
-        if _is_telegram_guest_query:
-            _streaming_enabled = False
-
         if _streaming_enabled:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -27974,7 +27946,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # answerBusinessConnectionQuery. Typing actions are unrelated Bot API
         # calls and are intentionally skipped for this one-shot lane.
         _adapter = self._adapter_for_source(source)
-        if _adapter and not _is_telegram_guest_query:
+        if _adapter:
             try:
                 await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
             except Exception:
