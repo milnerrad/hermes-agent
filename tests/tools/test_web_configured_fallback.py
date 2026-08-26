@@ -249,7 +249,7 @@ class TestKeyedSearchFallback:
 
         assert result["success"] is True
         assert secondary.search_calls == 0
-        keyless.assert_called_once_with("exa", "q", 5)
+        keyless.assert_called_once_with("exa", "q", 10)
 
     def test_same_provider_is_not_retried_as_its_own_fallback(self, monkeypatch):
         primary = _Provider(
