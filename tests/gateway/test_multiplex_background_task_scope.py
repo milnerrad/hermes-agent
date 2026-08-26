@@ -73,4 +73,3 @@ class TestBackgroundTaskProfileScope:
         assert observed == [False]
         assert async_delivery_supported() is True
 
-
