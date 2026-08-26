@@ -450,8 +450,9 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
             builtin = {"json_parse", "shell_quote", "retry"}
             if missing in builtin:
                 return (
-                    f"{missing} is a BUILT-IN helper in the sandbox — no import "
-                    f"needed. Remove it from the import line and call {missing}(...) directly."
+                    f"{missing} is exported by the generated hermes_tools module. "
+                    "The module is stale or incomplete; retry in a fresh execute_code call "
+                    f"and use `from hermes_tools import {missing}`."
                 )
             return (
                 f"'{missing}' is not available inside the execute_code sandbox. "
@@ -461,8 +462,8 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
         m = re.search(r"NameError: name '(json_parse|shell_quote|retry)' is not defined", window)
         if m:
             return (
-                f"{m.group(1)} is built into the generated sandbox module — "
-                "call it directly at module scope without importing it."
+                f"Import it in the script with `from hermes_tools import {m.group(1)}` "
+                "before calling it."
             )
         m = re.search(r"ModuleNotFoundError: No module named '([\w.]+)'", window)
         if m:
@@ -2397,10 +2398,12 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "50KB shows head/tail inline; the FULL text is auto-saved to a file "
         "whose path rides in the result.\n\n"
         f"{cwd_note}\n\n"
-        "Built-in helpers (no import): json_parse(text) — tolerant "
-        "json.loads for terminal() output; shell_quote(s) — shlex.quote for "
-        "dynamic shell args; retry(fn, max_attempts=3, delay=2) — "
-        "exponential backoff."
+        "Print your final result to stdout; stdlib (json, re, csv, datetime, ...) "
+        "is available for processing.\n\n"
+        "Import helpers with `from hermes_tools import json_parse, shell_quote, retry`: "
+        "json_parse(text) — tolerant json.loads for terminal() output; "
+        "shell_quote(s) — shlex.quote for dynamic shell args; "
+        "retry(fn, max_attempts=3, delay=2) — exponential backoff for transient failures."
     )
 
     return {

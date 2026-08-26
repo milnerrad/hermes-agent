@@ -189,6 +189,33 @@ class TestProactivePruneLoopWiring:
         assert tool_rows, "expected tool rows in the final transcript"
         assert all(m["content"] == marker for m in tool_rows)
 
+    def test_committed_prune_resets_retrieval_dedup_caches(self, agent):
+        """A committed prune can remove prior skill/file bodies from context.
+
+        Their retrieval caches must be invalidated so the next skill_view or
+        read_file returns full content rather than an unchanged-content stub
+        pointing at text the prune removed.
+        """
+        committed = False
+
+        def _prune(messages, current_tokens=None):
+            nonlocal committed
+            if committed:
+                return messages, 0
+            committed = True
+            return [dict(m) for m in messages], 1
+
+        agent.context_compressor.prune_tool_results_only = _prune
+        with (
+            patch("tools.skills_tool.reset_skill_view_dedup") as reset_skill,
+            patch("tools.file_tools.reset_file_dedup") as reset_file,
+        ):
+            result = _run_tool_loop(agent, n_tool_iterations=2)
+
+        assert result["completed"] is True
+        reset_skill.assert_called_once_with(agent._current_task_id)
+        reset_file.assert_called_once_with(agent._current_task_id)
+
     def test_noop_input_object_commits_nothing(self, agent):
         """Engine returns the INPUT object with a (bogus) non-zero count —
         the caller's ``result is not input`` gate must refuse the commit."""
