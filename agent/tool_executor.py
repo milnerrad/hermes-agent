@@ -15,6 +15,7 @@ from pathlib import Path
 import logging
 import os
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -45,6 +46,12 @@ from agent.tool_dispatch_helpers import (
     _plan_tool_batch_segments,
     make_tool_result_message,
 )
+from agent.tool_argument_integrity import (
+    INCOMPLETE_TOOL_ARGUMENTS_KEY,
+    incomplete_tool_arguments_after_schema_decode as _incomplete_after_schema_decode,
+    incomplete_tool_arguments_error_result as _incomplete_tool_arguments_error_result,
+    is_incomplete_tool_arguments_error_result as _is_incomplete_tool_arguments_error_result,
+)
 from tools.terminal_tool_lifecycle import get_active_env
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
@@ -55,6 +62,14 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+_INCOMPLETE_KEY_ESCAPE_RE = re.compile(
+    "".join(
+        rf"(?:{re.escape(char)}|\\+u00{ord(char):02x})"
+        for char in INCOMPLETE_TOOL_ARGUMENTS_KEY
+    ),
+    re.IGNORECASE,
+)
 
 
 _pairing_tool_call_id = coalesce_tool_call_id  # canonical id used by the persisted assistant message
@@ -150,17 +165,52 @@ class _BatchAbandoned(BaseException):
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
-    """Parse model-emitted arguments without repairing or coercing them."""
+    """Parse model-emitted arguments and reject lossy historical previews."""
     try:
         arguments = json.loads(raw_arguments)
     except (json.JSONDecodeError, TypeError):
         arguments = None
+    incomplete_result = _incomplete_tool_arguments_error_result(arguments)
+    if isinstance(arguments, dict) and incomplete_result:
+        return {}, incomplete_result
     if isinstance(arguments, dict):
         return arguments, None
     return {}, json.dumps(
         {"error": "Invalid tool arguments", "message": "Tool arguments must be a valid JSON object; tool was not executed."},
         ensure_ascii=False,
     )
+
+
+def _schema_decoded_integrity_result(
+    function_name: str, function_args: dict[str, Any]
+) -> Optional[str]:
+    """Purely preview schema container decoding before execution lifecycle."""
+    from tools.registry import registry
+
+    schema = registry.get_schema(function_name)
+    parameters = schema.get("parameters") if isinstance(schema, dict) else None
+    if not isinstance(parameters, dict):
+        return None
+    preview_args = function_args
+    try:
+        from tools.schema_sanitizer import unrename_tool_args
+
+        preview_args = unrename_tool_args(parameters, dict(function_args))
+    except Exception:
+        pass
+    return _incomplete_after_schema_decode(preview_args, parameters)
+
+
+def _may_contain_incomplete_provenance(value: Any) -> bool:
+    """Cheap gate for literal or JSON-escaped reserved provenance keys."""
+    if isinstance(value, str):
+        serialized = value
+    else:
+        try:
+            serialized = json.dumps(value, ensure_ascii=True)
+        except (TypeError, ValueError):
+            return False
+    return _INCOMPLETE_KEY_ESCAPE_RE.search(serialized) is not None
 
 
 def _resolve_concurrent_tool_timeout() -> float | None:
@@ -398,6 +448,9 @@ def _unwrap_tool_search_call(
             # Both executors retain the wrapper: scope/probe/hooks run per entry
             # in the batch dispatcher, not against a synthetic registry name.
             return function_name, function_args, None
+        integrity_result = _incomplete_tool_arguments_error_result(underlying_args)
+        if integrity_result:
+            return underlying, underlying_args, integrity_result
         if underlying not in _tool_search_scoped_names(agent):
             return function_name, function_args, (
                 f"'{underlying}' is not available in this session. Use tool_search to find tools you can call."
@@ -440,7 +493,79 @@ def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _Parse
     scope_block = None
     if parse_error is None:
         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
+        if scope_block is None and _may_contain_incomplete_provenance(args):
+            scope_block = _schema_decoded_integrity_result(name, args)
     return _ParsedCall(tool_call, name, args, [], parse_error, scope_block)
+
+
+def _integrity_result_for_call(pc: _ParsedCall) -> Optional[str]:
+    """Return a fail-closed integrity result without treating ordinary parse/scope errors as provenance failures."""
+    if _is_incomplete_tool_arguments_error_result(pc.parse_error):
+        return pc.parse_error
+    if _is_incomplete_tool_arguments_error_result(pc.scope_block):
+        return pc.scope_block
+    return None
+
+
+def _append_integrity_rejection(agent, messages: list, ref: _ToolCallRef, result: str) -> bool:
+    """Persist an integrity rejection without firing activity, middleware, lifecycle, or UI callbacks."""
+    message = make_tool_result_message(
+        ref.name, result, ref.call_id, effect_disposition="none"
+    )
+    # Integrity diagnostics are executor-authored control results, not output
+    # from the rejected external tool; keep their machine-readable JSON raw.
+    message["content"] = result
+    message.pop("_tool_output_risk", None)
+    messages.append(message)
+    return _flush_session_db_after_tool_progress(
+        agent, messages, stage=f"rejected incomplete tool arguments {ref.name}"
+    )
+
+
+def _append_interrupted_parsed_results(
+    agent,
+    messages: list,
+    parsed_calls: list[_ParsedCall],
+    effective_task_id: str,
+    *,
+    notice: str,
+    stop_on_flush_failure: bool = True,
+) -> bool:
+    """Classify every unstarted call before cancellation; integrity failures stay lifecycle-silent."""
+    agent._vprint(
+        f"{agent.log_prefix}⚡ Interrupt: skipping {len(parsed_calls)} {notice}",
+        force=True,
+    )
+    flush_ok = True
+    for pc in parsed_calls:
+        ref = pc.ref(effective_task_id)
+        integrity_result = _integrity_result_for_call(pc)
+        if integrity_result is not None:
+            current_ok = _append_integrity_rejection(agent, messages, ref, integrity_result)
+            flush_ok = flush_ok and current_ok
+            if not current_ok and stop_on_flush_failure:
+                return False
+            continue
+        result = f"[Tool execution cancelled — {ref.name} was skipped due to user interrupt]"
+        messages.append(
+            make_tool_result_message(
+                ref.name, result, ref.call_id, effect_disposition="none"
+            )
+        )
+        ref.emit_post(
+            agent,
+            result,
+            status="cancelled",
+            error_type="user_interrupt",
+            error_message="Tool execution skipped due to user interrupt",
+        )
+        current_ok = _flush_session_db_after_tool_progress(
+            agent, messages, stage=f"cancelled tool result {ref.name}"
+        )
+        flush_ok = flush_ok and current_ok
+        if not current_ok and stop_on_flush_failure:
+            return False
+    return flush_ok or not stop_on_flush_failure
 
 
 @dataclass
@@ -1167,8 +1292,12 @@ class _ConcurrentBatch:
         self.timeout_s = timeout_s
         self.results: list[Optional[_ToolOutcome]] = [None] * len(parsed_calls)
         for i, pc in enumerate(parsed_calls):
-            if pc.parse_error is not None:
-                self.results[i] = _ToolOutcome(pc.ref(effective_task_id), pc.parse_error, 0.0, True, True)
+            integrity_result = _integrity_result_for_call(pc)
+            terminal_result = integrity_result or pc.parse_error
+            if terminal_result is not None:
+                self.results[i] = _ToolOutcome(
+                    pc.ref(effective_task_id), terminal_result, 0.0, True, True
+                )
         self.gate = _StartOrderGate(_start_order_gate_timeout(timeout_s))
         self.authorization_gate = _ConcurrentToolAuthorizationGate()
         self.timed_out_indices: set[int] = set()
@@ -1330,7 +1459,11 @@ class _ConcurrentBatch:
 
     def run(self) -> None:
         """Dispatch the runnable calls on a daemon pool and wait for the batch."""
-        runnable = [i for i, pc in enumerate(self.parsed_calls) if pc.parse_error is None]
+        runnable = [
+            i
+            for i, pc in enumerate(self.parsed_calls)
+            if pc.parse_error is None and _integrity_result_for_call(pc) is None
+        ]
         if not runnable:
             return
         deadline = time.monotonic() + self.timeout_s if self.timeout_s is not None else None
@@ -1375,6 +1508,13 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
     """Append every slot's result in original call order; returns False at the first
     failed flush (the caller must stop the batch)."""
     for i, pc in enumerate(batch.parsed_calls):
+        integrity_result = _integrity_result_for_call(pc)
+        if integrity_result is not None:
+            if not _append_integrity_rejection(
+                agent, messages, pc.ref(effective_task_id), integrity_result
+            ):
+                return False
+            continue
         r = batch.results[i]
         # A worker may finish between the deadline snapshot and this loop;
         # prefer its real result over a fabricated timeout.
@@ -1416,19 +1556,27 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     num_tools = len(tool_calls)
     _tool_budget = _budget_for_agent(agent)  # once per turn, not per result
 
+    parsed_calls = [_parse_tool_call(agent, tc) for tc in tool_calls]
+
+    # Parse and integrity-classify before honoring a pre-existing interrupt.
+    # Integrity rejections remain lifecycle-silent; ordinary malformed calls are
+    # cancelled consistently with replayable calls when cancellation is pending.
     if agent._interrupt_requested:
-        print(f"{agent.log_prefix}⚡ Interrupt: skipping {num_tools} tool call(s)")
-        _append_skipped_tool_results(
-            agent, messages, tool_calls, effective_task_id,
-            content="[Tool execution cancelled — {name} was skipped due to user interrupt]",
-            hook_error_type="user_interrupt",
-            flush_stage="cancelled tool result",
+        _append_interrupted_parsed_results(
+            agent,
+            messages,
+            parsed_calls,
+            effective_task_id,
+            notice="tool call(s)",
             stop_on_flush_failure=False,
         )
         return
 
-    parsed_calls = [_parse_tool_call(agent, tc) for tc in tool_calls]
-
+    runnable_calls = [
+        pc
+        for pc in parsed_calls
+        if pc.parse_error is None and _integrity_result_for_call(pc) is None
+    ]
     tool_names_str = ", ".join(pc.name for pc in parsed_calls)
     if _tool_progress_enabled(agent):
         print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
@@ -1436,10 +1584,23 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Resolved before the batch is built so the start-order gate can clamp under the deadline.
     timeout_s = _resolve_concurrent_tool_timeout()
     batch = _ConcurrentBatch(agent, messages, effective_task_id, parsed_calls, timeout_s)
-    agent._current_tool = tool_names_str
-    agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
+    if runnable_calls:
+        runnable_names = ", ".join(pc.name for pc in runnable_calls)
+        agent._current_tool = runnable_names
+        agent._touch_activity(
+            f"executing {len(runnable_calls)} tools concurrently: {runnable_names}"
+        )
 
-    spinner = _start_quiet_tool_spinner(agent, "", {}, label=f"⚡ running {num_tools} tools concurrently")
+    spinner = (
+        _start_quiet_tool_spinner(
+            agent,
+            "",
+            {},
+            label=f"⚡ running {len(runnable_calls)} tools concurrently",
+        )
+        if runnable_calls
+        else None
+    )
     try:
         batch.run()
     finally:
@@ -1672,25 +1833,33 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     owns turn-end work)."""
     _tool_budget = _budget_for_agent(agent)  # once per turn, not per result
     tool_calls = assistant_message.tool_calls
+    # Parse every call up front so provenance failures are classified before any
+    # pre-existing interrupt or lifecycle/callback side effect.
+    parsed_calls = [
+        _parse_tool_call(agent, tool_call, flatten_probe=True)
+        for tool_call in tool_calls
+    ]
 
-    for i, tool_call in enumerate(tool_calls, 1):
+    for i, pc in enumerate(parsed_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
-        # Check interrupt BEFORE each tool so a "stop" during the previous one skips the rest.
         if agent._interrupt_requested:
-            if not _skip_remaining_sequential(
-                agent, messages, tool_calls[i - 1:], effective_task_id,
+            if not _append_interrupted_parsed_results(
+                agent,
+                messages,
+                parsed_calls[i - 1 :],
+                effective_task_id,
                 notice="tool call(s)",
-                content="[Tool execution cancelled — {name} was skipped due to user interrupt]",
-                hook_error_type="user_interrupt",
-                hook_id=lambda tc: getattr(tc, "id", "") or "",
-                flush_stage="cancelled tool result",
             ):
                 return
             break
 
-        pc = _parse_tool_call(agent, tool_call, flatten_probe=True)
         ref = pc.ref(effective_task_id)
+        integrity_result = _integrity_result_for_call(pc)
+        if integrity_result is not None:
+            if not _append_integrity_rejection(agent, messages, ref, integrity_result):
+                return
+            continue
         if pc.parse_error is not None:
             if not _append_invalid_arguments_result(agent, messages, ref, pc.parse_error):
                 return
@@ -1709,12 +1878,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if not _publish_sequential_result(agent, messages, ref, managed, tool_duration=tool_duration, index=i, budget=_tool_budget):
             return
 
-        if agent._interrupt_requested and i < len(tool_calls):
-            if not _skip_remaining_sequential(
-                agent, messages, tool_calls[i:], effective_task_id,
+        if agent._interrupt_requested and i < len(parsed_calls):
+            if not _append_interrupted_parsed_results(
+                agent,
+                messages,
+                parsed_calls[i:],
+                effective_task_id,
                 notice="remaining tool call(s)",
-                content="[Tool execution skipped — {name} was not started. User sent a new message]",
-                flush_stage="skipped tool result",
             ):
                 return
             break
