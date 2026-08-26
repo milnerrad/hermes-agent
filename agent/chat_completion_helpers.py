@@ -1382,6 +1382,11 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
 
 
 def _build_api_kwargs_for_mode(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+    from agent.tool_argument_integrity import neutralize_completed_incomplete_tool_calls
+
+    # Project a request-only copy before any provider-specific preparation. The
+    # canonical transcript retains the compression marker for fail-closed replay.
+    api_messages = neutralize_completed_incomplete_tool_calls(api_messages)
     # One-shot continuation override — consumed exactly once, on the FIRST
     # request this call builds (only one api_mode branch runs per invocation).
     reasoning_config = _reasoning_config_for_wire(agent)

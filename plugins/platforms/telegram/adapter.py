@@ -450,6 +450,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
         # CJK stays on legacy MarkdownV2 by default (Desktop/macOS garble, #47653); opt-in for unaffected clients.
         self._allow_cjk_rich_messages: bool = self._coerce_bool_extra("allow_cjk_rich_messages", False)
+        # Operator preference: route ordinary markdown through Bot API 10.1 rich messages too.
+        self._rich_all_markdown_enabled: bool = self._coerce_bool_extra("rich_all_markdown", False)
         self._rich_drafts_enabled: bool = self._coerce_bool_extra("rich_drafts", False)
         self._rich_send_disabled = self._rich_draft_disabled = False  # latched after a capability failure
         # Transient sendChatAction failures recur on every keep-typing tick; back off per chat.
@@ -1269,6 +1271,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not content:
             return False
+        if getattr(self, "_rich_all_markdown_enabled", False):
+            return bool(content.strip())
         if any(_TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()):
             return True
         if re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+", content):

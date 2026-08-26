@@ -3295,6 +3295,21 @@ class GatewayRunner(
     GatewayAgentCacheMixin, GatewayProfileReconcileMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
+    async def _run_background_task(
+        self, prompt: str, source: "SessionSource", task_id: str,
+        event_message_id: Optional[str] = None, media_urls: Optional[List[str]] = None,
+        media_types: Optional[List[str]] = None,
+    ) -> None:
+        """Run a finite background turn without advertising late async delivery."""
+        from gateway.session_context import declare_stateless_channel
+
+        # The messaging chat remains routable, but this copied /background context ends when the
+        # finite turn returns; detached children must not target it for later completion delivery.
+        declare_stateless_channel()
+        return await GatewayTurnMixin._run_background_task(
+            self, prompt, source, task_id, event_message_id, media_urls, media_types,
+        )
+
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
     _busy_input_mode: str = "interrupt"
     _busy_text_mode: str = "interrupt"

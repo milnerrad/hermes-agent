@@ -216,6 +216,28 @@ class TestProactivePruneLoopWiring:
         assert warned, "over-threshold turn with no compaction ran silently"
         assert all(r.startswith("attempts_exhausted") for r in warned)
 
+    def test_committed_prune_resets_retrieval_dedup_caches(self, agent):
+        """A committed prune invalidates retrieval stubs whose source body may have been removed."""
+        committed = False
+
+        def _prune(messages, current_tokens=None):
+            nonlocal committed
+            if committed:
+                return messages, 0
+            committed = True
+            return [dict(m) for m in messages], 1
+
+        agent.context_compressor.prune_tool_results_only = _prune
+        with (
+            patch("tools.skills_tool.reset_skill_view_dedup") as reset_skill,
+            patch("tools.file_tools_read_tracking.reset_file_dedup") as reset_file,
+        ):
+            result = _run_tool_loop(agent, n_tool_iterations=2)
+
+        assert result["completed"] is True
+        reset_skill.assert_called_once_with(agent._current_task_id)
+        reset_file.assert_called_once_with(agent._current_task_id)
+
     def test_noop_input_object_commits_nothing(self, agent):
         """Engine returns the INPUT object with a (bogus) non-zero count —
         the caller's ``result is not input`` gate must refuse the commit."""

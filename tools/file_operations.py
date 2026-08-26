@@ -29,12 +29,38 @@ from tools.file_operations_common import (
     _UTF8_BOM, _detect_line_ending, _has_bom, _normalize_line_endings, _strip_bom,
     _strip_terminal_fence_leaks, normalize_read_pagination, normalize_search_pagination)
 from tools.file_operations_lint import LINTERS_INPROC, LintMixin, _FAIL_CLOSED_INPROC_EXTS
-from tools.file_operations_search import SearchMixin
+from tools.file_operations_search import (
+    SearchMixin,
+    _OUTPUT_MODE_FLAGS,
+    _parse_search_output,
+    _pattern_has_regex_newline,
+    _search_stdout_and_limit,
+    _split_tool_diagnostics,
+)
 
 logger = logging.getLogger(__name__)
 
 # Controller home; SearchMixin reads it (tests monkeypatch it here).
 _HOME = str(Path.home())
+
+
+def _rg_diagnostic_requires_pcre2(diagnostics: str) -> bool:
+    """Whether rg's actual parser error names a supported PCRE2-only construct."""
+    supported_errors = {
+        "error: look-around, including look-ahead and look-behind, is not supported",
+        "error: backreferences are not supported",
+    }
+    nonempty = [line.rstrip().lower() for line in diagnostics.splitlines() if line]
+    if not nonempty or nonempty[0] != "rg: regex parse error:":
+        return False
+    # The recommendation must be part of rg's complete parser diagnostic. An
+    # indented copy of an error line came from the user-controlled pattern and
+    # must not trigger the retry.
+    normalized = " ".join(line.strip() for line in nonempty[1:])
+    if "consider enabling pcre2 with the --pcre2 flag" not in normalized:
+        return False
+    return any(line in supported_errors for line in nonempty[1:])
+
 
 # --- Binary-content identification -------------------------------------------
 
@@ -188,6 +214,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         self._command_cache: Dict[str, bool] = {}
         self._rg_resolution_cache: Dict[str, str] = {}
         self._rg_modified_capability: Dict[str, Optional[str]] = {}
+        self._rg_pcre2_capability: Dict[str, bool] = {}
 
     def _exec(self, command: str, cwd: str = None, timeout: int = None,
               stdin_data: str = None) -> ExecuteResult:
@@ -216,6 +243,116 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
+
+    def _pattern_with_end_of_options(self, pattern: str) -> str:
+        """Shell-quote a user pattern with the engine's option terminator."""
+        return f"-- {self._escape_shell_arg(pattern)}"
+
+    # Compatibility name retained for the canonical regression tests.
+    _pattern_arg = _pattern_with_end_of_options
+
+    def _rg_supports_pcre2(self, executable: str = "rg") -> bool:
+        """Probe PCRE2 support once for each resolved ripgrep executable."""
+        if executable not in self._rg_pcre2_capability:
+            result = self._exec(
+                f"{self._quote_executable(executable)} --pcre2-version", timeout=5)
+            self._rg_pcre2_capability[executable] = result.exit_code == 0
+        return self._rg_pcre2_capability[executable]
+
+    def _zero_match_probe(self, pattern: str, path: str,
+                          file_glob: Optional[str]) -> Optional[str]:
+        """Run upstream's near-miss probes with safe pattern argv placement."""
+        # Normal search dispatch has already resolved rg and populated the
+        # cache. Direct probe calls use the PATH name without another discovery
+        # subprocess, preserving the probe's bounded three-command contract.
+        rg_executable = self._rg_resolution_cache.get("rg") or "rg"
+        rg = self._quote_executable(rg_executable)
+        has_meta = bool(re.search(r"[.\[\](){}?*+^$\\|]", pattern))
+        glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
+        for flags, template in self._ZERO_MATCH_PROBES:
+            if flags == "-F" and not has_meta:
+                continue
+            glob_expr_probe = (
+                f"{glob_expr} {self._search_prune_glob_args()}"
+                if flags.startswith("--hidden") else glob_expr)
+            probe = self._exec(
+                f"{rg} {flags} --count-matches{glob_expr_probe} "
+                f"{self._pattern_with_end_of_options(pattern)} "
+                f"{self._escape_native_tool_arg(path)} 2>/dev/null | head -50",
+                timeout=30)
+            total, per_file = 0, []
+            for line in (probe.stdout or "").strip().splitlines():
+                found_path, _sep, count = line.rpartition(":")
+                if count.isdigit():
+                    total += int(count)
+                    per_file.append(found_path)
+            if total > 0:
+                extra = len(per_file) - 5
+                paths = ", ".join(per_file[:5]) + (f" (+{extra} more)" if extra > 0 else "")
+                return template.format(total=total, n=len(per_file), paths=paths)
+        return None
+
+    def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
+                        limit: int, offset: int, output_mode: str, context: int,
+                        rg_executable: Optional[str] = None) -> SearchResult:
+        """Upstream rg search with safe argv and a targeted one-shot PCRE2 retry."""
+        # Normal dispatch discovers and supplies the executable. Keep direct calls
+        # (including compatibility tests) on PATH without adding a discovery call.
+        rg_executable = rg_executable or "rg"
+        cmd_parts = [self._quote_executable(rg_executable), "--line-number", "--no-heading", "--with-filename"]
+        if output_mode not in ("files_only", "count"):
+            cmd_parts.extend(["--max-columns", "2000", "--max-columns-preview"])
+        multiline = _pattern_has_regex_newline(pattern)
+        if multiline:
+            cmd_parts.append("--multiline")
+        if context > 0:
+            cmd_parts.extend(["-C", str(context)])
+        cmd_parts.extend(self._rg_exclusion_globs(path))
+        if file_glob:
+            cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
+        if output_mode in _OUTPUT_MODE_FLAGS:
+            cmd_parts.append(_OUTPUT_MODE_FLAGS[output_mode])
+        cmd_parts.append(self._pattern_with_end_of_options(pattern))
+        cmd_parts.append(self._escape_native_tool_arg(path))
+
+        warning = (
+            "Pattern contains \\n — multiline mode (-U) was enabled automatically "
+            "so the regex can match across line boundaries."
+        ) if multiline else None
+        fetch_limit = limit + offset + (200 if context > 0 else 0)
+
+        def run(parts: list[str]):
+            command = "set -o pipefail; " + " ".join(
+                parts + ["|", "head", "-n", str(fetch_limit)])
+            return self._exec(command, timeout=60)
+
+        result = run(cmd_parts)
+        stdout, _limit_reason = _search_stdout_and_limit(result)
+        diagnostics, payload = _split_tool_diagnostics(stdout)
+        if (
+            result.exit_code == 2
+            and not payload.strip()
+            and _rg_diagnostic_requires_pcre2(diagnostics)
+            and self._rg_supports_pcre2(rg_executable)
+        ):
+            pcre_parts = list(cmd_parts)
+            pcre_parts.insert(1, "--pcre2")
+            result = run(pcre_parts)
+        return _parse_search_output(
+            result, output_mode, limit, offset, context, warning=warning)
+
+    def _grep_cmd(self, head: list[str], pattern: str, output_mode: str,
+                  context: int, file_glob: Optional[str] = None) -> list[str]:
+        """Build grep argv with ``--`` immediately before the user pattern."""
+        parts = list(head)
+        if context > 0:
+            parts.extend(["-C", str(context)])
+        if file_glob:
+            parts.extend(["--include", self._escape_shell_arg(file_glob)])
+        if output_mode in _OUTPUT_MODE_FLAGS:
+            parts.append(_OUTPUT_MODE_FLAGS[output_mode])
+        parts.append(self._pattern_with_end_of_options(pattern))
+        return parts
 
     def _cat(self, path: str) -> ExecuteResult:
         """``cat`` the file with stderr silenced (missing file → non-zero exit)."""
