@@ -368,6 +368,25 @@ raise RuntimeError("deliberate crash")
         self.assertIn("RuntimeError", result.get("error", "") + result.get("output", ""))
 
 
+    def test_helper_import_guidance_matches_runtime_contract(self):
+        """Helpers live in hermes_tools and must be imported by user scripts."""
+        from tools.code_execution_tool import build_execute_code_schema
+
+        description = build_execute_code_schema()["description"]
+        self.assertIn(
+            "from hermes_tools import json_parse, shell_quote, retry",
+            description,
+        )
+        self.assertNotIn("Built-in helpers (no import)", description)
+
+    def test_sandbox_failure_hint_recommends_helper_import(self):
+        """The recovery hint must not prescribe the known-broken direct-call form."""
+        from tools.code_execution_tool import _sandbox_failure_hint
+
+        hint = _sandbox_failure_hint("NameError: name 'json_parse' is not defined") or ""
+        self.assertIn("from hermes_tools import json_parse", hint)
+        self.assertNotIn("call it directly", hint)
+
     def test_shell_quote_helper(self):
         """shell_quote properly escapes dangerous characters."""
         code = """

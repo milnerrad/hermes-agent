@@ -23,7 +23,7 @@ from tools.url_safety import async_is_safe_url
 from tools.web_tools_rescue import _rescue_eligible, _rescue_search
 from tools.web_tools_truncate import _effective_char_limit, _trim_results, _truncate_results, convert_base64_images_to_links
 from tools.web_tools_extract import (
-    _extract_safe_urls, _merge_in_order, _no_provider_error, _resolve_extract_provider, _result_entry,
+    _NO_RESULT_ERROR, _no_provider_error, _resolve_extract_provider, _result_entry,
     _strict_selection_error, _validate_extract_urls,
 )
 
@@ -263,6 +263,346 @@ def _finish_debug(call_name: str, debug_call_data: dict, error_msg: Optional[str
     return None if error_msg is None else tool_error(error_msg)
 
 
+def _get_fallback_backend(capability: str) -> str:
+    """Configured request-level secondary; capability-specific wins over shared."""
+    cfg = _load_web_config()
+    return (
+        cfg.get(f"{capability}_fallback_backend")
+        or cfg.get("fallback_backend")
+        or ""
+    ).lower().strip()
+
+
+def _get_secondary_provider(primary_name: str, capability: str):
+    """Resolve a distinct, available, non-keyless provider for *capability*."""
+    name = _get_fallback_backend(capability)
+    if not name or name == primary_name:
+        return None
+    try:
+        from agent.web_search_registry import get_provider
+        from plugins.web.keyless_mcp import provider_tier
+
+        provider = get_provider(name)
+        supports = getattr(provider, f"supports_{capability}", None)
+        if provider is None or not callable(supports) or not supports():
+            logger.warning("web.%s_fallback_backend '%s' is unavailable or unsupported", capability, name)
+            return None
+        if provider_tier(name) == "free":
+            logger.warning("Configured web.%s fallback '%s' is keyless; skipping it", capability, name)
+            return None
+        if not provider.is_available():
+            logger.warning("Configured web.%s fallback '%s' is unavailable; skipping it", capability, name)
+            return None
+        return provider
+    except Exception as exc:  # noqa: BLE001 — fallback is best-effort
+        logger.warning("web %s fallback '%s' could not load: %s", capability, name, exc)
+        return None
+
+
+def _try_fallback_search(
+    primary_name: str, original_error: str, query: str, limit: int
+) -> tuple[dict | None, str]:
+    """Try the configured secondary search provider once, before keyless rescue."""
+    provider = _get_secondary_provider(primary_name, "search")
+    if provider is None:
+        return None, ""
+    logger.warning(
+        "web_search backend '%s' failed (%s); trying configured fallback '%s'",
+        primary_name, (original_error or "")[:200], provider.name,
+    )
+    try:
+        result = provider.search(query, limit)
+    except Exception as exc:  # noqa: BLE001 — keyless rescue may still run
+        return None, str(exc)
+    if not isinstance(result, dict):
+        return None, "search returned an invalid response"
+    if not result.get("success"):
+        return None, str(result.get("error", "search failed"))
+    data = result.setdefault("data", {})
+    if not isinstance(data, dict):
+        return None, "search returned invalid data"
+    data.update(
+        served_by=provider.name,
+        fallback_from=primary_name,
+        backend_error=(original_error or "unknown error")[:300],
+    )
+    return result, ""
+
+
+def _policy_blocked_result(result: object) -> bool:
+    """Website-policy refusals are terminal and must never change providers."""
+    if not isinstance(result, dict):
+        return False
+    return bool(result.get("blocked_by_policy")) or (
+        "blocked by website policy" in str(result.get("error") or "").lower()
+    )
+
+
+def _map_extract_rows_by_url(urls: list, indices: list[int], rows: object) -> dict[int, dict]:
+    """Map untrusted provider rows by exact URL, preserving duplicate occurrence identity."""
+    if not isinstance(rows, list):
+        return {}
+    pending: dict[str, list[int]] = {}
+    for index in indices:
+        if index < len(urls) and isinstance(urls[index], str):
+            pending.setdefault(urls[index], []).append(index)
+    mapped = {}
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("url"), str):
+            continue
+        candidates = pending.get(row["url"])
+        if candidates:
+            mapped[candidates.pop(0)] = row
+    return mapped
+
+
+def _ordered_extract_batch(urls: list, rows: object) -> list | None:
+    if not isinstance(rows, list) or len(rows) != len(urls):
+        return None
+    mapped = _map_extract_rows_by_url(urls, list(range(len(urls))), rows)
+    return [mapped[i] for i in range(len(urls))] if len(mapped) == len(urls) else None
+
+
+def _extract_failure_message(rows: object) -> str:
+    candidates = rows if isinstance(rows, list) else []
+    return next(
+        (str(row["error"]) for row in candidates if isinstance(row, dict) and row.get("error")),
+        "extract failed",
+    )
+
+
+async def _call_extract(provider, urls: list[str], format: str | None):
+    import asyncio
+    import inspect
+
+    if inspect.iscoroutinefunction(provider.extract):
+        return await provider.extract(urls, format=format)
+    return await asyncio.to_thread(provider.extract, urls, format=format)
+
+
+async def _try_fallback_extract(
+    primary_name: str, urls: list, results: list, *, format: str | None = None
+) -> tuple[list | None, str]:
+    """Retry a genuine whole-batch failure through the configured secondary.
+
+    Rows are associated only by exact URL, including duplicate occurrences. Policy
+    refusals are retained and excluded from every later provider.
+    """
+    provider = _get_secondary_provider(primary_name, "extract")
+    if provider is None:
+        return None, ""
+
+    ordered = _ordered_extract_batch(urls, results)
+    if ordered is not None:
+        retry_indices = [
+            i for i, row in enumerate(ordered)
+            if row.get("error") and not _policy_blocked_result(row)
+        ]
+    else:
+        rows = results if isinstance(results, list) else []
+        if any(_policy_blocked_result(row) for row in rows):
+            return None, ""  # identity is incomplete: fail closed on policy
+        retry_indices = list(range(len(urls)))
+    if not retry_indices:
+        return None, ""
+
+    retry_urls = [urls[i] for i in retry_indices]
+    original_error = _extract_failure_message(results)
+    logger.warning(
+        "web_extract backend '%s' failed (%s); trying configured fallback '%s'",
+        primary_name, original_error[:200], provider.name,
+    )
+    try:
+        retried = await _call_extract(provider, retry_urls, format)
+    except Exception as exc:  # noqa: BLE001 — keyless rescue may still run
+        return None, str(exc)
+
+    mapped = _map_extract_rows_by_url(urls, retry_indices, retried)
+    for row in mapped.values():
+        if not row.get("error"):
+            metadata = row.setdefault("metadata", {})
+            if isinstance(metadata, dict):
+                metadata.update(
+                    served_by=provider.name,
+                    fallback_from=primary_name,
+                    backend_error=(original_error or "unknown error")[:300],
+                )
+
+    if ordered is not None:
+        merged = list(ordered)
+        for index, row in mapped.items():
+            if _policy_blocked_result(row) or not row.get("error"):
+                merged[index] = row
+        if any(_policy_blocked_result(row) or not row.get("error") for row in mapped.values()):
+            return merged, ""
+    elif len(mapped) == len(urls):
+        complete = [mapped[i] for i in range(len(urls))]
+        if any(_policy_blocked_result(row) or not row.get("error") for row in complete):
+            return complete, ""
+    elif any(_policy_blocked_result(row) for row in mapped.values()):
+        # A short secondary may still reveal an exact redirect-time refusal.
+        original = _map_extract_rows_by_url(urls, list(range(len(urls))), results)
+        merged = [original.get(i, _result_entry(url, _NO_RESULT_ERROR)) for i, url in enumerate(urls)]
+        for index, row in mapped.items():
+            if _policy_blocked_result(row) or not row.get("error"):
+                merged[index] = row
+        return merged, ""
+
+    fallback_error = next(
+        (str(row["error"]) for row in mapped.values() if row.get("error")),
+        "extract returned no valid results",
+    )
+    return None, fallback_error
+
+
+def _fallback_extract_needs_rescue(urls: list, results: list) -> bool:
+    """Continue after fallback only when every non-policy row still failed."""
+    ordered = _ordered_extract_batch(urls, results)
+    if ordered is None:
+        return False
+    rescueable = [row for row in ordered if not _policy_blocked_result(row)]
+    return bool(rescueable) and all(row.get("error") for row in rescueable)
+
+
+def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
+    """Keyless rescue with exact URL mapping and policy-preserving positional merge."""
+    from plugins.web.keyless_mcp import extract_with_failover
+
+    ordered = _ordered_extract_batch(urls, results)
+    if ordered is not None:
+        rescue_indices = [
+            i for i, row in enumerate(ordered)
+            if row.get("error") and not _policy_blocked_result(row)
+        ]
+    else:
+        raw_rows = results if isinstance(results, list) else []
+        if any(_policy_blocked_result(row) for row in raw_rows):
+            # With incomplete identity, a refusal cannot be partitioned safely.
+            # Configured fallback normalizes identified policy rows to a complete
+            # batch before continuation reaches this function.
+            return results
+        rescue_indices = list(range(len(urls)))
+    if not rescue_indices:
+        return ordered if ordered is not None else results
+
+    rescue_urls = [urls[i] for i in rescue_indices]
+    original_error = _extract_failure_message(results)
+    logger.warning(
+        "web_extract backend '%s' failed %d URL(s) (%s); one-shot keyless rescue",
+        provider_name, len(rescue_urls), original_error[:200],
+    )
+    rescued = extract_with_failover(provider_name, list(rescue_urls))
+    mapped = _map_extract_rows_by_url(urls, rescue_indices, rescued)
+    replacements = {
+        index: row for index, row in mapped.items()
+        if _policy_blocked_result(row) or not row.get("error")
+    }
+    if not replacements:
+        return ordered if ordered is not None else results
+    for row in replacements.values():
+        if not row.get("error"):
+            metadata = row.setdefault("metadata", {})
+            if isinstance(metadata, dict):
+                metadata.update(rescued_from=provider_name, backend_error=original_error[:300])
+    if ordered is not None:
+        merged = list(ordered)
+        for index, row in replacements.items():
+            merged[index] = row
+        return merged
+    return [mapped[i] for i in range(len(urls))] if len(mapped) == len(urls) else results
+
+
+def _merge_in_order(
+    total: int, fixed: dict[int, dict], fetch_positions: list[int], fetch_urls: list[str], results: list
+) -> list:
+    """Restore caller order without trusting provider response order or URL uniqueness."""
+    mapped = _map_extract_rows_by_url(fetch_urls, list(range(len(fetch_urls))), results)
+    merged = dict(fixed)
+    for offset, position in enumerate(fetch_positions):
+        merged[position] = mapped.get(offset, _result_entry(fetch_urls[offset], _NO_RESULT_ERROR))
+    return [merged[i] for i in range(total)]
+
+
+async def _dispatch_extract(provider, fetch_urls: list[str], format: str | None) -> list:
+    """Primary -> configured secondary -> keyless rescue; cache primary successes only."""
+    from tools.web_result_cache import extract_cache_put
+
+    primary_exception = None
+    try:
+        results = await _call_extract(provider, fetch_urls, format)
+    except Exception as exc:  # noqa: BLE001 — fallback/rescue candidate
+        primary_exception = exc
+        results = [_result_entry(url, str(exc)) for url in fetch_urls]
+
+    rows = results if isinstance(results, list) else []
+    whole_failure = not rows or all(not isinstance(row, dict) or row.get("error") for row in rows)
+    if whole_failure:
+        failures = rows or [_result_entry(url, "Extract backend returned no results") for url in fetch_urls]
+        fallback, _fallback_error = await _try_fallback_extract(
+            provider.name, fetch_urls, failures, format=format
+        )
+        if fallback is not None:
+            if _extract_rescue_eligible(provider) and _fallback_extract_needs_rescue(fetch_urls, fallback):
+                return _rescue_extract(provider.name, fetch_urls, fallback)
+            return fallback
+        if _extract_rescue_eligible(provider):
+            return _rescue_extract(provider.name, fetch_urls, failures)
+        if primary_exception is not None:
+            raise primary_exception
+        return failures
+
+    # Cache only exact-URL primary successes; fallback/rescue responses are one-shot.
+    mapped = _map_extract_rows_by_url(fetch_urls, list(range(len(fetch_urls))), rows)
+    for index, row in mapped.items():
+        content = row.get("raw_content", "") or row.get("content", "")
+        if content and not row.get("error") and not _policy_blocked_result(row):
+            extract_cache_put(
+                fetch_urls[index], content, row.get("title", ""),
+                format=format, provider=provider.name,
+            )
+    return rows
+
+
+def _extract_rescue_eligible(provider) -> bool:
+    """Use the decomposed extract module's hook so existing integrations can patch it."""
+    try:
+        from tools import web_tools_extract
+        hook = getattr(web_tools_extract, "_rescue_eligible", _rescue_eligible)
+    except Exception:
+        hook = _rescue_eligible
+    return bool(hook(provider))
+
+
+async def _extract_safe_urls(provider, safe_urls: list[str], format: str | None) -> list:
+    """Apply policy, then primary-keyed cache, then fallback-aware dispatch."""
+    from tools.web_result_cache import extract_cache_get
+    from tools.website_policy import check_website_access
+
+    fixed, fetch_urls, fetch_positions = {}, [], []
+    for position, url in enumerate(safe_urls):
+        try:
+            policy = check_website_access(url)
+        except Exception:  # noqa: BLE001 — existing policy behavior fails open
+            policy = None
+        if policy is not None:
+            message = policy.get("message", "Blocked by website policy") if isinstance(policy, dict) else "Blocked by website policy"
+            fixed[position] = {**_result_entry(url, message), "blocked_by_policy": True}
+            continue
+        hit = extract_cache_get(url, format=format, provider=provider.name)
+        if hit is not None:
+            fixed[position] = hit
+        else:
+            fetch_urls.append(url)
+            fetch_positions.append(position)
+    if not fetch_urls:
+        return [fixed[i] for i in range(len(safe_urls))]
+    logger.info("Web extract via %s: %d URL(s)", provider.name, len(fetch_urls))
+    fetched = await _dispatch_extract(provider, fetch_urls, format)
+    if not fixed:
+        return _merge_in_order(len(safe_urls), {}, fetch_positions, fetch_urls, fetched)
+    return _merge_in_order(len(safe_urls), fixed, fetch_positions, fetch_urls, fetched)
+
+
 def web_search_tool(query: str, limit: int = 5) -> str:
     """Search the web via the configured backend.
 
@@ -320,14 +660,31 @@ def _memoized_search(provider, query: str, limit: int) -> dict:
 
     def _paid_search() -> tuple[dict, bool]:
         fetch_limit = bucket_limit(limit)
+        primary_exception = None
         try:
             resp = provider.search(query, fetch_limit)
-        except Exception as exc:  # noqa: BLE001 — candidate for rescue
-            if not _rescue_eligible(provider):
-                raise
-            return _rescue_search(provider.name, str(exc), query, fetch_limit), True
-        if not resp.get("success") and _rescue_eligible(provider):
-            return _rescue_search(provider.name, str(resp.get("error", "")), query, fetch_limit), True
+        except Exception as exc:  # noqa: BLE001 — fallback/rescue candidate
+            primary_exception = exc
+            resp = {"success": False, "error": str(exc)}
+        if isinstance(resp, dict) and resp.get("success"):
+            return resp, False
+        if not isinstance(resp, dict):
+            resp = {"success": False, "error": "search returned an invalid response"}
+        original_error = str(resp.get("error", ""))
+        fallback, fallback_error = _try_fallback_search(
+            provider.name, original_error, query, fetch_limit
+        )
+        if fallback is not None:
+            return fallback, True
+        if _rescue_eligible(provider):
+            if fallback_error:
+                original_error += (
+                    f"; configured fallback '{_get_fallback_backend('search')}' also failed "
+                    f"({fallback_error[:200]})"
+                )
+            return _rescue_search(provider.name, original_error, query, fetch_limit), True
+        if primary_exception is not None:
+            raise primary_exception
         return resp, False
 
     response_data = search_memo.lookup(provider.name, query, limit)

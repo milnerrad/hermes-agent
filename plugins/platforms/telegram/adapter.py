@@ -438,6 +438,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # separate opt-in (Desktop can leave rich draft frames overlaid): off keeps native draft transport
         # but skips rich draft rendering; the final reply still lands via sendRichMessage.
         self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
+        # Operator preference: when rich_messages is enabled, route ordinary
+        # markdown (headings, bold/italic, simple lists) through Bot API 10.1
+        # rich messages too.  This keeps the default copy-friendly MarkdownV2
+        # behavior while allowing users to prefer Telegram's richer native view.
+        self._rich_all_markdown_enabled: bool = self._coerce_bool_extra("rich_all_markdown", False)
+        # Rich draft previews use a separate opt-in. Telegram macOS / Desktop
+        # can leave Bot API 10.1 rich draft frames visually overlaid until the
+        # chat is redrawn, while final rich messages remain useful.
+        # When rich_messages is on but rich_drafts is off, keep native DM draft
+        # *transport* and only skip rich draft *rendering*. The persistent
+        # reply still lands through sendRichMessage so tables are not flattened
+        # by the MarkdownV2 formatter.
         self._rich_drafts_enabled: bool = self._coerce_bool_extra("rich_drafts", False)
         self._rich_send_disabled = self._rich_draft_disabled = False  # latched after a capability failure
         # Transient sendChatAction failures recur on every keep-typing tick; back off per chat.
@@ -1255,6 +1267,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not content:
             return False
+        if getattr(self, "_rich_all_markdown_enabled", False):
+            return bool(content.strip())
         if any(_TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()):
             return True
         if re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+", content):
