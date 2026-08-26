@@ -23532,6 +23532,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         resolve from that profile's secret scope. Mirrors the pattern in
         ``_run_agent``.
         """
+        from gateway.session_context import declare_stateless_channel
+
+        # A /background task owns a finite agent turn. Late detached children
+        # cannot route back through this copied context after it returns.
+        declare_stateless_channel()
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
@@ -28870,7 +28875,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
-
         if _streaming_enabled:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -28899,7 +28903,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _stream_consumer:
             stream_task = asyncio.create_task(_stream_consumer.run())
 
-        # Send typing indicator
         _adapter = self._adapter_for_source(source)
         if _adapter:
             try:

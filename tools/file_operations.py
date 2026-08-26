@@ -460,6 +460,26 @@ def _split_tool_diagnostics(output: str) -> tuple[str, str]:
     return '\n'.join(diagnostics), '\n'.join(payload)
 
 
+def _rg_diagnostic_requires_pcre2(diagnostics: str) -> bool:
+    """Whether rg's actual error line names a PCRE2-only construct."""
+    supported_errors = {
+        "error: look-around, including look-ahead and look-behind, is not supported",
+        "error: backreferences are not supported",
+    }
+    lines = [line.rstrip().lower() for line in diagnostics.splitlines()]
+    nonempty = [line for line in lines if line]
+    if not nonempty or nonempty[0] != "rg: regex parse error:":
+        return False
+    # Anchor the trigger inside rg's complete parser diagnostic. User-controlled
+    # patterns are indented, while path/I/O diagnostics do not include rg's
+    # PCRE2 recommendation. Normalize whitespace so harmless rg wording wraps
+    # do not silently disable the fallback.
+    normalized = " ".join(line.strip() for line in nonempty[1:])
+    if "consider enabling pcre2 with the --pcre2 flag" not in normalized:
+        return False
+    return any(line in supported_errors for line in nonempty[1:])
+
+
 # A real rg/grep output line starts with a path token and is followed by a
 # ``:`` (match/count), a ``-`` (context), or nothing (files_only). Tool
 # diagnostics ("rg: ...", "grep: ...", "error: ...", indented carets) never
@@ -965,6 +985,7 @@ class ShellFileOperations(FileOperations):
 
         # Cache for command availability checks
         self._command_cache: Dict[str, bool] = {}
+        self._rg_pcre2_available: Optional[bool] = None
     
     def _exec(self, command: str, cwd: str = None, timeout: int = None,
               stdin_data: str = None) -> ExecuteResult:
@@ -1011,6 +1032,13 @@ class ShellFileOperations(FileOperations):
             result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
+
+    def _rg_supports_pcre2(self) -> bool:
+        """Probe PCRE2 support once per file-operations instance."""
+        if self._rg_pcre2_available is None:
+            result = self._exec("rg --pcre2-version", timeout=5)
+            self._rg_pcre2_available = result.exit_code == 0
+        return self._rg_pcre2_available
     
     def _sample_file_bytes(self, path: str, length: int = 1000):
         """Fetch the first ``length`` raw bytes of a file through the terminal.
@@ -1191,6 +1219,32 @@ class ShellFileOperations(FileOperations):
         arg = _bash_safe_path(arg)
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
+
+    def _pattern_arg(self, pattern: str) -> str:
+        """Escape *pattern* and prefix it with the ``--`` end-of-options
+        separator, as a single string ready to drop into a search
+        command's argv.
+
+        Single choke point for the rg/grep argv fix in issue #85795: a
+        pattern starting with ``-`` (the Markdown checkbox ``- [ ]``,
+        diff-style ``-foo`` lines, etc.) is parsed as a flag by rg/grep
+        themselves unless preceded by ``--``; ``_escape_shell_arg``'s
+        quoting only protects against shell word-splitting, not the
+        target program's own argv parsing. ``--`` is a de-facto
+        convention rather than POSIX-mandated, but is accepted by every
+        variant this project actually shells out to (GNU grep, BSD grep,
+        ripgrep, BusyBox grep).
+
+        Every rg/grep command this class builds -- including the
+        ``_zero_match_probe`` diagnostic sub-searches -- must go through
+        this helper rather than inlining ``-- {escaped pattern}``
+        separately, so a future call site can't reintroduce the missing-
+        separator bug (review of #85798, point 2: the probe's own
+        duplication is exactly how the original issue slipped past the
+        main search path).
+        """
+        return f"-- {self._escape_shell_arg(pattern)}"
+
 
     def _escape_native_tool_arg(self, arg: str) -> str:
         """Escape a path argument destined for a NATIVE Windows binary.
@@ -2990,7 +3044,7 @@ class ShellFileOperations(FileOperations):
         glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
         probe = self._exec(
             f"rg -i --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+            f"{self._pattern_arg(pattern)} {self._escape_native_tool_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -3007,7 +3061,7 @@ class ShellFileOperations(FileOperations):
         # missing from results).
         hidden = self._exec(
             f"rg --hidden --no-ignore --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+            f"{self._pattern_arg(pattern)} {self._escape_native_tool_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -3021,7 +3075,7 @@ class ShellFileOperations(FileOperations):
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = self._exec(
                 f"rg -F --count-matches{glob_expr} "
-                f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+                f"{self._pattern_arg(pattern)} {self._escape_native_tool_arg(path)} "
                 f"2>/dev/null | head -50",
                 timeout=30,
             )
@@ -3257,8 +3311,11 @@ class ShellFileOperations(FileOperations):
         elif output_mode == "count":
             cmd_parts.append("-c")  # Count per file
         
-        # Add pattern and path
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        # Add pattern and path. `--` stops option parsing so a pattern that
+        # starts with "-" (e.g. the Markdown checkbox "- [ ]") is not read
+        # as a flag by rg itself -- see _pattern_arg()'s docstring for the
+        # full rationale.
+        cmd_parts.append(self._pattern_arg(pattern))
         # rg is a native Windows binary when installed via winget/cargo/choco:
         # it needs the C:/... path form, not the MSYS /c/... form (which
         # nothing converts back — Hermes sets MSYS_NO_PATHCONV for its bash).
@@ -3275,8 +3332,12 @@ class ShellFileOperations(FileOperations):
         # error code (2) and making the guard below unreachable. rg handles a
         # truncating head cleanly (exit 0 on SIGPIPE), so pipefail does not
         # introduce false errors on a successful-but-truncated search.
-        cmd = "set -o pipefail; " + " ".join(cmd_parts)
-        result = self._exec(cmd, timeout=60)
+        def render_pipeline(parts: list[str]) -> str:
+            return "set -o pipefail; " + " ".join(parts)
+
+        search_timeout = 60
+        cmd = render_pipeline(cmd_parts)
+        result = self._exec(cmd, timeout=search_timeout)
         stdout, limit_reason = _search_stdout_and_limit(result)
 
         # _exec merges stderr into stdout (stderr=subprocess.STDOUT), so rg's
@@ -3284,6 +3345,22 @@ class ShellFileOperations(FileOperations):
         # are interleaved with match output. Split them out: diagnostics must
         # not be parsed as matches, and on a hard error they ARE the message.
         diagnostics, payload = _split_tool_diagnostics(stdout)
+
+        # Rust regex intentionally excludes look-around and backreferences.
+        # Retry exactly once with PCRE2 only when rg's diagnostic names one of
+        # those constructs; unrelated parse errors retain the normal path.
+        if (
+            result.exit_code == 2
+            and not payload.strip()
+            and _rg_diagnostic_requires_pcre2(diagnostics)
+            and self._rg_supports_pcre2()
+        ):
+            pcre_cmd_parts = list(cmd_parts)
+            pcre_cmd_parts.insert(1, "--pcre2")
+            pcre_cmd = render_pipeline(pcre_cmd_parts)
+            result = self._exec(pcre_cmd, timeout=search_timeout)
+            stdout, limit_reason = _search_stdout_and_limit(result)
+            diagnostics, payload = _split_tool_diagnostics(stdout)
 
         # rg exit codes: 0=matches found, 1=no matches, 2=error. rg returns 2
         # even on partial errors (e.g. one unreadable file in a tree that
@@ -3418,7 +3495,10 @@ class ShellFileOperations(FileOperations):
         # ``.*`` to exclude the entire search. Anchor relative paths at the
         # shell's live cwd; quoting $PWD separately keeps user paths escaped
         # while working across local, container, and remote backends.
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        # `--` stops option parsing so a pattern that starts with "-" (e.g.
+        # the Markdown checkbox "- [ ]") is not read as a flag by grep
+        # itself -- see _pattern_arg()'s docstring for the full rationale.
+        cmd_parts.append(self._pattern_arg(pattern))
         is_absolute = path.startswith(("/", "\\\\")) or bool(
             re.match(r"^[A-Za-z]:[\\/]", path)
         )
