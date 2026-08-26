@@ -2119,6 +2119,43 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         function_args, malformed_args_result = _parse_tool_arguments(
             tool_call.function.arguments
         )
+        if (
+            malformed_args_result is not None
+            and agent._interrupt_requested
+            and not _is_incomplete_tool_arguments_error_result(
+                malformed_args_result
+            )
+        ):
+            cancelled_result = (
+                f"[Tool execution cancelled — {function_name} was skipped "
+                "due to user interrupt]"
+            )
+            messages.append(
+                make_tool_result_message(
+                    function_name,
+                    cancelled_result,
+                    tool_call_id,
+                    effect_disposition="none",
+                )
+            )
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=cancelled_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                status="cancelled",
+                error_type="user_interrupt",
+                error_message="Tool execution skipped due to user interrupt",
+            )
+            if not _flush_session_db_after_tool_progress(
+                agent,
+                messages,
+                stage=f"cancelled tool result {function_name}",
+            ):
+                return
+            continue
         if malformed_args_result is not None:
             if not _is_incomplete_tool_arguments_error_result(
                 malformed_args_result
