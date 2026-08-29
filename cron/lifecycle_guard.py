@@ -288,6 +288,7 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
+_HEREDOC_DATA_SINK_EXECUTABLES = frozenset({"cat"})
 _HEREDOC_NON_SHELL_EXECUTABLES = frozenset(
     {"node", "nodejs", "deno", "bun", "ruby", "perl", "php", "lua", "r", "rscript"}
 )
@@ -629,6 +630,8 @@ def _classify_heredoc_receiver(receiver: Optional[str]) -> str:
     name = receiver.lower()
     if name in _SHELL_EXECUTABLES:
         return "shell"
+    if name in _HEREDOC_DATA_SINK_EXECUTABLES:
+        return "data_sink"
     if _PYTHON_EXECUTABLE.fullmatch(name) or name in _HEREDOC_NON_SHELL_EXECUTABLES:
         return "non_shell"
     return "unknown"
@@ -1440,10 +1443,14 @@ def _contains_unsafe_gateway_action(
     for receiver_kind, body, delimiter_quoted in heredocs:
         if not body:
             continue
-        # A quoted delimiter suppresses shell expansion, so a clearly
-        # non-shell receiver gets inert source/data. Unquoted bodies still
-        # perform command substitution before stdin delivery and must retain
-        # the conservative shell walk (e.g. $(sh ./restart.sh)).
+        # A quoted delimiter suppresses shell expansion. A proven plain data
+        # sink cannot execute its body at all, while a non-shell interpreter
+        # still receives executable source that needs the restricted direct
+        # command scan below. Overrides were classified as unknown and retain
+        # the conservative full shell walk. Unquoted bodies still perform
+        # command substitution before stdin delivery (e.g. $(sh ./restart.sh)).
+        if receiver_kind == "data_sink" and delimiter_quoted:
+            continue
         if receiver_kind == "non_shell" and delimiter_quoted:
             if _contains_unsafe_gateway_action(
                 body,
