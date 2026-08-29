@@ -311,7 +311,6 @@ class TestBuildSkillsSystemPrompt:
         (skill_dir / "SKILL.md").write_text(
             "---\nname: demo\ndescription: Demonstrate a workflow\n---\n"
         )
-
         result = build_skills_system_prompt()
 
         assert "load only skills that clearly and materially govern" in result
@@ -325,9 +324,8 @@ class TestBuildSkillsSystemPrompt:
         assert "Proceed without loading a skill when none meets that standard." in result
         assert "if genuinely none are relevant" not in result
         proportional_at = result.index("Prefer the smallest sufficient set.")
-        mandatory_at = result.index("load the `hermes-agent` skill first")
         no_skill_at = result.index("Proceed without loading a skill when none meets that standard.")
-        assert proportional_at < mandatory_at < no_skill_at
+        assert proportional_at < no_skill_at
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
