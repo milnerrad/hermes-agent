@@ -1208,6 +1208,38 @@ JS
             command, cwd=str(tmp_path)
         ) is False
 
+    def test_quoted_cat_heredoc_lifecycle_prose_is_not_shell_walked(self):
+        """Quoted stdin consumed by plain cat is inert data, not shell source."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        command = """cat > /tmp/runbook.md <<'EOF'
+If recovery is needed, a human can run: hermes gateway restart
+EOF
+"""
+        assert contains_gateway_lifecycle_command_or_referenced_script(command) is False
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "cat() { sh; }\n",
+            "alias cat='sh'\n",
+            "PATH=/tmp/hermes-test-bin:$PATH ",
+        ],
+    )
+    def test_quoted_cat_heredoc_override_context_still_blocks(self, prefix):
+        """An overridden cat name is not proof that quoted stdin stays inert."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        command = f"""{prefix}cat <<'EOF'
+hermes gateway restart
+EOF
+"""
+        assert contains_gateway_lifecycle_command_or_referenced_script(command) is True
+
     def test_python_heredoc_literal_lifecycle_command_still_blocks(self):
         from cron.lifecycle_guard import (
             contains_gateway_lifecycle_command_or_referenced_script,
@@ -1216,6 +1248,18 @@ JS
 import os
 os.system("hermes gateway restart")
 PY
+"""
+        assert contains_gateway_lifecycle_command_or_referenced_script(command) is True
+
+    def test_applescript_heredoc_shell_lifecycle_command_still_blocks(self):
+        """Executable interpreter heredocs are not treated as inert data sinks."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        command = """osascript <<'APPLESCRIPT'
+do shell script "hermes gateway restart"
+APPLESCRIPT
 """
         assert contains_gateway_lifecycle_command_or_referenced_script(command) is True
 
