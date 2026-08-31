@@ -156,6 +156,98 @@ async def test_rich_all_markdown_routes_plain_markdown_to_rich():
 
 
 @pytest.mark.asyncio
+async def test_opt_in_shell_fence_adds_exact_copy_button_to_rich_message():
+    adapter = _make_adapter(
+        extra={
+            "rich_all_markdown": True,
+            "copy_buttons_for_shell_blocks": True,
+        }
+    )
+    command = "sudo systemctl status hermes-gateway"
+
+    result = await adapter.send("12345", f"Run this:\n\n```bash\n{command}\n```")
+
+    assert result.success is True
+    assert _rich_api_kwargs(adapter)["reply_markup"] == {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Copy command",
+                    "copy_text": {"text": command},
+                }
+            ]
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_shell_copy_buttons_are_opt_in():
+    adapter = _make_adapter(extra={"rich_all_markdown": True})
+
+    result = await adapter.send("12345", "```bash\nprintf 'safe\\n'\n```")
+
+    assert result.success is True
+    assert "reply_markup" not in _rich_api_kwargs(adapter)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "language", ["bash", "sh", "shell", "console", "terminal", "BASH"]
+)
+async def test_shell_copy_button_accepts_supported_fence_languages(language):
+    adapter = _make_adapter(
+        extra={"rich_all_markdown": True, "copy_buttons_for_shell_blocks": True}
+    )
+
+    await adapter.send("12345", f"```{language}\nprintf 'safe\\n'\n```")
+
+    button = _rich_api_kwargs(adapter)["reply_markup"]["inline_keyboard"][0][0]
+    assert button["copy_text"]["text"] == "printf 'safe\\n'"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("length, expected", [(256, True), (257, False)])
+async def test_shell_copy_button_enforces_telegram_text_limit(length, expected):
+    adapter = _make_adapter(
+        extra={"rich_all_markdown": True, "copy_buttons_for_shell_blocks": True}
+    )
+
+    await adapter.send("12345", f"```bash\n{'x' * length}\n```")
+
+    assert ("reply_markup" in _rich_api_kwargs(adapter)) is expected
+
+
+@pytest.mark.asyncio
+async def test_multiple_shell_blocks_get_numbered_exact_copy_buttons():
+    adapter = _make_adapter(
+        extra={"rich_all_markdown": True, "copy_buttons_for_shell_blocks": True}
+    )
+    first = "set -euo pipefail\nprintf 'one\\n'"
+    second = "sudo systemctl status hermes-gateway"
+    content = f"First:\n```bash\n{first}\n```\n\nSecond:\n```sh\n{second}\n```"
+
+    await adapter.send("12345", content)
+
+    rows = _rich_api_kwargs(adapter)["reply_markup"]["inline_keyboard"]
+    assert rows == [
+        [{"text": "Copy command 1", "copy_text": {"text": first}}],
+        [{"text": "Copy command 2", "copy_text": {"text": second}}],
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("language", ["", "python", "json"])
+async def test_non_shell_fences_do_not_get_copy_buttons(language):
+    adapter = _make_adapter(
+        extra={"rich_all_markdown": True, "copy_buttons_for_shell_blocks": True}
+    )
+
+    await adapter.send("12345", f"```{language}\nprint('not a shell command')\n```")
+
+    assert "reply_markup" not in _rich_api_kwargs(adapter)
+
+
+@pytest.mark.asyncio
 async def test_expect_edits_metadata_keeps_preview_on_legacy_path():
     adapter = _make_adapter()
 
@@ -690,6 +782,25 @@ async def test_finalize_edit_uses_rich_for_table_content():
     # No fresh send / delete — the whole point of the in-place rich edit.
     adapter._bot.edit_message_text.assert_not_called()
     adapter._bot.delete_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finalize_rich_edit_adds_shell_copy_button():
+    adapter = _make_adapter(
+        extra={"rich_all_markdown": True, "copy_buttons_for_shell_blocks": True}
+    )
+    command = "sudo systemctl status hermes-gateway"
+
+    result = await adapter.edit_message(
+        "12345", "555", f"```bash\n{command}\n```", finalize=True,
+    )
+
+    assert result.success is True
+    assert _rich_edit_kwargs(adapter)["reply_markup"] == {
+        "inline_keyboard": [
+            [{"text": "Copy command", "copy_text": {"text": command}}]
+        ]
+    }
 
 
 @pytest.mark.asyncio

@@ -471,6 +471,35 @@ _RICH_PROTECTED_REGION_RE = re.compile(
     re.MULTILINE,
 )
 
+_SHELL_COPY_FENCE_RE = re.compile(
+    r"^```[ \t]*(?:bash|sh|shell|console|terminal)[ \t]*\r?\n"
+    r"(?P<body>[\s\S]*?)\r?\n```[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _shell_copy_reply_markup(text: str) -> Optional[Dict[str, Any]]:
+    """Build Telegram copy buttons for shell fences within Bot API limits."""
+    commands = [
+        match.group("body")
+        for match in _SHELL_COPY_FENCE_RE.finditer(text)
+        if 1 <= utf16_len(match.group("body")) <= 256
+    ]
+    if not commands:
+        return None
+    multiple = len(commands) > 1
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": f"Copy command {index}" if multiple else "Copy command",
+                    "copy_text": {"text": command},
+                }
+            ]
+            for index, command in enumerate(commands, start=1)
+        ]
+    }
+
 
 def _rich_normalize_linebreaks(text: str) -> str:
     """Convert single ``\\n`` to Markdown hard breaks for the rich-message path.
@@ -686,6 +715,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # as plain text, which is worse than degraded table/task-list rendering
         # for command snippets and mobile handoffs.
         self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
+        self._copy_buttons_for_shell_blocks: bool = self._coerce_bool_extra(
+            "copy_buttons_for_shell_blocks", False
+        )
         # Operator preference: when rich_messages is enabled, route ordinary
         # markdown (headings, bold/italic, simple lists) through Bot API 10.1
         # rich messages too.  This keeps the default copy-friendly MarkdownV2
@@ -2269,6 +2301,10 @@ class TelegramAdapter(BasePlatformAdapter):
             # params are silently ignored by the Bot API, so the scalar would
             # quietly drop the reply anchor instead of erroring.
             payload["reply_parameters"] = {"message_id": reply_to_id}
+        if self._copy_buttons_for_shell_blocks:
+            reply_markup = _shell_copy_reply_markup(content)
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
 
         try:
             # Take the raw Bot API result (dict under real PTB). Passing
@@ -2371,6 +2407,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # sends the caller through the legacy table-to-bullets fallback.
         if getattr(self, "_disable_link_previews", False):
             payload["link_preview_options"] = {"is_disabled": True}
+        if self._copy_buttons_for_shell_blocks:
+            reply_markup = _shell_copy_reply_markup(content)
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
         try:
             # Raw Bot API result; do not request return_type=Message (PTB does
             # not fully model the 10.1 response shape yet — a post-edit parse

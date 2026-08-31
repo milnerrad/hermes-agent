@@ -977,9 +977,11 @@ gateway:
       extra:
         rich_messages: true
         rich_drafts: false
+        # Add native clipboard buttons below short fenced shell commands.
+        copy_buttons_for_shell_blocks: false
 ```
 
-This setting is for client-rendering/copy compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. Set `rich_all_markdown: true` if you also want ordinary markdown (headings, bold/italic, simple lists) to use Telegram's rich-message renderer instead of the MarkdownV2 path. `rich_drafts` controls whether the DM streaming preview *renders* rich (`sendRichMessageDraft`) and stays off by default because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws; with it off, the preview streams plain and the final still arrives as a native Rich Message. If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
+This setting is for client-rendering/copy compatibility; Hermes already falls back automatically when Telegram rejects the rich API call. Set `rich_all_markdown: true` if you also want ordinary markdown (headings, bold/italic, simple lists) to use Telegram's rich-message renderer instead of the MarkdownV2 path. Set `copy_buttons_for_shell_blocks: true` to attach native Telegram `Copy command` buttons to final rich messages containing fenced `bash`, `sh`, `shell`, `console`, or `terminal` blocks whose exact contents fit Telegram's 1–256 character `CopyTextButton` limit. Multiple eligible blocks receive numbered buttons; previews and longer blocks receive none. `rich_drafts` controls whether the DM streaming preview *renders* rich (`sendRichMessageDraft`) and stays off by default because Telegram Desktop/macOS can visually overlay rich draft frames until the chat redraws; with it off, the preview streams plain and the final still arrives as a native Rich Message. If you only want the legacy "always code-block" table behavior while keeping rich messages enabled, disable table normalization by setting `telegram.pretty_tables: false` in `config.yaml` (default: `true`).
 
 **Link previews.** Telegram auto-generates link previews for URLs in bot messages. If you'd rather suppress those (long `/tools` output, agent reply that mentions ten links, etc.):
 
