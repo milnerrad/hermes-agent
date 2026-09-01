@@ -1593,19 +1593,28 @@ async def web_extract_tool(
                         if fallback_results is not None:
                             _served_non_primary = True
                             results = fallback_results
-                        elif _rescue_eligible(provider):
+                        ordinary_failures_remain = any(
+                            result.get("error") and not _policy_blocked_result(result)
+                            for result in results
+                        )
+                        if _rescue_eligible(provider) and ordinary_failures_remain:
                             _served_non_primary = True
                             rescue_results = results
                             if fallback_error:
                                 rescue_results = [
-                                    {
-                                        **result,
-                                        "error": (
-                                            f"{result.get('error', '')}; configured fallback "
-                                            f"'{_get_fallback_backend('extract')}' also failed "
-                                            f"({fallback_error[:200]})"
-                                        ),
-                                    }
+                                    (
+                                        {
+                                            **result,
+                                            "error": (
+                                                f"{result.get('error', '')}; configured fallback "
+                                                f"'{_get_fallback_backend('extract')}' also failed "
+                                                f"({fallback_error[:200]})"
+                                            ),
+                                        }
+                                        if result.get("error")
+                                        and not _policy_blocked_result(result)
+                                        else result
+                                    )
                                     for result in results
                                 ]
                             results = await asyncio.to_thread(
