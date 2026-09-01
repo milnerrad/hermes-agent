@@ -605,6 +605,70 @@ def _policy_blocked_result(result: dict) -> bool:
     return "blocked by website policy" in str(result.get("error") or "").lower()
 
 
+def _missing_extract_result(url: str) -> dict:
+    return {
+        "url": url,
+        "title": "",
+        "content": "",
+        "error": "Extract backend returned no result for this URL",
+    }
+
+
+def _normalize_extract_batch(urls: list, rows: Any) -> list:
+    """Return provider rows in exact request order without trusting positions."""
+    positions: dict[str, list[int]] = {}
+    for index, url in enumerate(urls):
+        positions.setdefault(url, []).append(index)
+
+    normalized = [_missing_extract_result(url) for url in urls]
+    consumed: dict[str, int] = {}
+    if not isinstance(rows, list):
+        return normalized
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = row.get("url")
+        if not isinstance(url, str) or url not in positions:
+            continue
+        occurrence = consumed.get(url, 0)
+        if occurrence >= len(positions[url]):
+            continue
+        normalized[positions[url][occurrence]] = row
+        consumed[url] = occurrence + 1
+    return normalized
+
+
+def _merge_extract_retry(
+    urls: list, originals: Any, retried: Any, retry_indices: list[int]
+) -> tuple[list, bool]:
+    """Merge retry successes/policy rows by exact URL with duplicate queues."""
+    merged = _normalize_extract_batch(urls, originals)
+    positions: dict[str, list[int]] = {}
+    for index in retry_indices:
+        positions.setdefault(urls[index], []).append(index)
+
+    consumed: dict[str, int] = {}
+    replaced = False
+    if not isinstance(retried, list):
+        return merged, replaced
+    for row in retried:
+        if not isinstance(row, dict):
+            continue
+        url = row.get("url")
+        if not isinstance(url, str) or url not in positions:
+            continue
+        occurrence = consumed.get(url, 0)
+        if occurrence >= len(positions[url]):
+            continue
+        index = positions[url][occurrence]
+        consumed[url] = occurrence + 1
+        if row.get("error") and not _policy_blocked_result(row):
+            continue
+        merged[index] = row
+        replaced = True
+    return merged, replaced
+
+
 async def _try_fallback_extract(
     primary_name: str, urls: list, results: list, *, format: str | None = None
 ) -> tuple[list | None, str]:
@@ -618,26 +682,21 @@ async def _try_fallback_extract(
     if provider is None:
         return None, ""
 
-    if len(results) == len(urls):
-        retry_indices = [
-            i for i, result in enumerate(results) if not _policy_blocked_result(result)
-        ]
-    elif any(_policy_blocked_result(result) for result in results):
-        # A malformed provider response cannot be mapped safely back to every
-        # input URL. Refuse the fallback rather than risk re-fetching a URL
-        # whose corresponding result says the user's policy blocked it.
-        return None, ""
-    else:
-        retry_indices = list(range(len(urls)))
+    original_results = _normalize_extract_batch(urls, results)
+    retry_indices = [
+        i
+        for i, result in enumerate(original_results)
+        if not _policy_blocked_result(result)
+    ]
     if not retry_indices:
         return None, ""
 
     retry_urls = [urls[i] for i in retry_indices]
     original_error = next(
         (
-            results[i].get("error")
+            original_results[i].get("error")
             for i in retry_indices
-            if i < len(results) and results[i].get("error")
+            if original_results[i].get("error")
         ),
         "extract failed",
     )
@@ -660,41 +719,35 @@ async def _try_fallback_extract(
     except Exception as exc:  # noqa: BLE001 — continue to keyless rescue
         return None, str(exc)
 
-    for result in retried:
-        if not result.get("error"):
+    if isinstance(retried, list):
+        for result in retried:
+            if not isinstance(result, dict) or result.get("error"):
+                continue
             metadata = result.setdefault("metadata", {})
+            if not isinstance(metadata, dict):
+                continue
             metadata["served_by"] = provider.name
             metadata["fallback_from"] = primary_name
             metadata["backend_error"] = (original_error or "unknown error")[:300]
 
-    # A secondary may discover a redirect-time website-policy refusal that the
-    # primary did not see. Preserve that result so the later keyless rescue can
-    # exclude it instead of losing the policy signal and fetching the URL.
-    if retried and any(_policy_blocked_result(result) for result in retried):
-        if len(results) == len(urls) and len(retried) == len(retry_indices):
-            merged = list(results)
-            for position, index in enumerate(retry_indices):
-                merged[index] = retried[position]
-            return merged, ""
-        return retried, ""
-
-    if not retried or all(result.get("error") for result in retried):
+    merged, replaced = _merge_extract_retry(
+        urls, original_results, retried, retry_indices
+    )
+    if not replaced:
         fallback_error = (
             next(
-                (result.get("error") for result in retried if result.get("error")),
+                (
+                    result.get("error")
+                    for result in retried
+                    if isinstance(result, dict) and result.get("error")
+                ),
                 "extract failed",
             )
-            if retried
+            if isinstance(retried, list) and retried
             else "extract returned no results"
         )
         return None, str(fallback_error)
-
-    if len(results) == len(urls) and len(retried) == len(retry_indices):
-        merged = list(results)
-        for position, index in enumerate(retry_indices):
-            merged[index] = retried[position]
-        return merged, ""
-    return retried, ""
+    return merged, ""
 
 
 def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
@@ -711,20 +764,20 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
     from plugins.web.keyless_mcp import extract_with_failover
 
     # Partition out policy blocks. Rescue only genuine backend failures.
-    if len(results) == len(urls):
-        rescue_idx = [i for i, r in enumerate(results) if not _policy_blocked_result(r)]
-    elif any(_policy_blocked_result(result) for result in results):
-        # With broken order parity, policy-blocked results cannot be mapped
-        # safely to all input URLs. Suppress rescue rather than bypass policy.
-        return results
-    else:  # defensive: provider broke order parity — treat all as rescueable
-        rescue_idx = list(range(len(results)))
+    original_results = _normalize_extract_batch(urls, results)
+    rescue_idx = [
+        i for i, result in enumerate(original_results) if not _policy_blocked_result(result)
+    ]
     if not rescue_idx:
-        return results  # every failure is an intentional policy block
+        return original_results  # every failure is an intentional policy block
 
-    rescue_urls = [urls[i] for i in rescue_idx] if len(results) == len(urls) else list(urls)
+    rescue_urls = [urls[i] for i in rescue_idx]
     original_error = next(
-        (results[i].get("error") for i in rescue_idx if results[i].get("error")),
+        (
+            original_results[i].get("error")
+            for i in rescue_idx
+            if original_results[i].get("error")
+        ),
         "extract failed",
     )
     logger.warning(
@@ -732,21 +785,18 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
         provider_name, len(rescue_urls), (original_error or "")[:200],
     )
     rescued = extract_with_failover(provider_name, list(rescue_urls))
-    rescued_errors = [r.get("error", "") for r in rescued]
-    if rescued and all(e for e in rescued_errors):
-        return results  # rescue also failed everywhere: keep original errors
-    for r in rescued:
-        if not r.get("error"):
+    if isinstance(rescued, list):
+        for r in rescued:
+            if not isinstance(r, dict) or r.get("error"):
+                continue
             meta = r.setdefault("metadata", {})
             if isinstance(meta, dict):
                 meta["rescued_from"] = provider_name
                 meta["backend_error"] = (original_error or "")[:300]
-    if len(rescued) == len(rescue_idx) and len(results) == len(urls):
-        merged = list(results)
-        for pos, i in enumerate(rescue_idx):
-            merged[i] = rescued[pos]
-        return merged
-    return rescued
+    merged, _ = _merge_extract_retry(
+        urls, original_results, rescued, rescue_idx
+    )
+    return merged
 
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
@@ -1535,7 +1585,8 @@ async def web_extract_tool(
                     else:
                         raise
                 else:
-                    if results and all(r.get("error") for r in results):
+                    results = _normalize_extract_batch(fetch_urls, results)
+                    if all(r.get("error") for r in results):
                         fallback_results, fallback_error = await _try_fallback_extract(
                             provider.name, fetch_urls, results, format=format
                         )

@@ -245,3 +245,63 @@ class TestExtractRescue:
                 monkeypatch, _KeyedBoomProvider(), ["https://a", "https://b"]
             )
         assert all("HTTP 500" in r.get("error", "") for r in results)
+
+    @pytest.mark.parametrize(
+        ("rescued", "expected_content"),
+        [
+            ([], ["", "", ""]),
+            ([{"url": "https://c", "content": "C"}], ["", "", "C"]),
+            (
+                [
+                    {"url": "https://c", "content": "C"},
+                    {"url": "https://a", "content": "A"},
+                    {"url": "https://b", "content": "B"},
+                ],
+                ["A", "B", "C"],
+            ),
+            (
+                [
+                    None,
+                    {"url": "https://unknown", "content": "unknown"},
+                    {"url": "https://b", "content": "B"},
+                    {"url": "https://a", "content": "A"},
+                ],
+                ["A", "B", ""],
+            ),
+        ],
+        ids=["empty", "short-later-url", "reordered", "long-unknown-nondict"],
+    )
+    def test_rescue_normalizes_adversarial_batches(self, rescued, expected_content):
+        urls = ["https://a", "https://b", "https://c"]
+        failed = [
+            {"url": url, "title": "", "content": "", "error": f"primary {url}"}
+            for url in urls
+        ]
+
+        with patch.object(keyless_mcp, "extract_with_failover", return_value=rescued):
+            out = web_tools._rescue_extract("keenable", urls, failed)
+
+        assert [row["url"] for row in out] == urls
+        assert [row.get("content", "") for row in out] == expected_content
+
+    def test_rescue_duplicate_urls_and_mixed_policy_failure(self):
+        urls = ["https://dup", "https://dup", "https://blocked", "https://failed"]
+        failed = [
+            {"url": url, "title": "", "content": "", "error": f"primary {i}"}
+            for i, url in enumerate(urls)
+        ]
+        rescued = [
+            {"url": "https://dup", "content": "first"},
+            {"url": "https://blocked", "error": "Blocked by website policy", "blocked_by_policy": True},
+            {"url": "https://failed", "error": "secondary failure"},
+            {"url": "https://dup", "content": "second"},
+            {"url": "https://dup", "content": "excess"},
+        ]
+
+        with patch.object(keyless_mcp, "extract_with_failover", return_value=rescued):
+            out = web_tools._rescue_extract("keenable", urls, failed)
+
+        assert [row["url"] for row in out] == urls
+        assert [out[0]["content"], out[1]["content"]] == ["first", "second"]
+        assert out[2]["blocked_by_policy"] is True
+        assert out[3] == failed[3]
