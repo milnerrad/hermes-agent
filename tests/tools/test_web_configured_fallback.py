@@ -508,6 +508,58 @@ class TestKeyedExtractFallback:
         keyless.assert_called_once_with("exa", [urls[1]])
 
     @pytest.mark.asyncio
+    async def test_mixed_secondary_policy_and_failure_continues_keyless_rescue(
+        self, monkeypatch
+    ):
+        urls = ["https://policy.example", "https://retry.example"]
+        primary = _Provider(
+            "exa",
+            extract_result=[
+                {"url": url, "title": "", "content": "", "error": "primary outage"}
+                for url in urls
+            ],
+        )
+        secondary = _Provider(
+            "tavily",
+            extract_result=[
+                {
+                    "url": urls[0],
+                    "error": "Blocked by website policy after redirect",
+                    "blocked_by_policy": True,
+                },
+                {"url": urls[1], "error": "secondary outage"},
+            ],
+        )
+        _registry(monkeypatch, {"exa": primary, "tavily": secondary})
+        monkeypatch.setattr(
+            web_tools,
+            "_load_web_config",
+            lambda: {"extract_backend": "exa", "fallback_backend": "tavily"},
+        )
+        monkeypatch.setattr(
+            "agent.web_search_provider.get_provider_env",
+            lambda name: "exa-key" if name == "EXA_API_KEY" else "",
+        )
+        monkeypatch.setattr(
+            "agent.web_search_registry._keyless_tier_enabled", lambda: True
+        )
+
+        async def _allow_all(candidate, **kwargs):
+            return True
+
+        monkeypatch.setattr(web_tools, "async_is_safe_url", _allow_all)
+        rescued = [{"url": urls[1], "content": "rescued"}]
+        with patch.object(
+            keyless_mcp, "extract_with_failover", return_value=rescued
+        ) as keyless:
+            result = json.loads(await web_tools.web_extract_tool(urls))["results"]
+
+        assert [row["url"] for row in result] == urls
+        assert result[0]["blocked_by_policy"] is True
+        assert result[1]["content"] == "rescued"
+        keyless.assert_called_once_with("exa", [urls[1]])
+
+    @pytest.mark.asyncio
     async def test_configured_fallback_merges_untrusted_batch_by_exact_url(
         self, monkeypatch
     ):
