@@ -39,6 +39,20 @@ def test_initial_rejection_skips_hooks_and_callbacks(agent, monkeypatch, concurr
     assert json.loads(messages[0]["content"])["error_type"] == "incomplete_historical_tool_arguments"
 
 
+def test_concurrent_integrity_only_batch_skips_concurrent_status(agent, capsys):
+    agent.quiet_mode = False
+    agent.tool_progress_mode = "all"
+    payload = {RESERVED: {"version": 1, "replayable": False}}
+    call = _mock_tool_call(name="terminal", arguments=json.dumps(payload), call_id="c1")
+    messages = []
+
+    with patch("run_agent.handle_function_call", side_effect=AssertionError("dispatch")):
+        _run(agent, True, call, messages)
+
+    assert "Concurrent:" not in capsys.readouterr().out
+    assert json.loads(messages[0]["content"])["error_type"] == "incomplete_historical_tool_arguments"
+
+
 @pytest.mark.parametrize("concurrent", [False, True])
 def test_deferred_rejection_skips_middleware_hooks_and_callbacks(
     agent, monkeypatch, concurrent
@@ -299,6 +313,88 @@ def test_concurrent_preexisting_interrupt_flushes_mixed_results_in_order(
     assert flushes == [["v"], ["v", "i"]]
     assert [entry["tool_call_id"] for entry in messages] == ["v", "i"]
     assert json.loads(messages[1]["content"])["error_type"] == "incomplete_historical_tool_arguments"
+
+
+@pytest.mark.parametrize("provenance_shape", ["direct", "deferred", "schema"])
+def test_sequential_mid_batch_interrupt_preserves_later_integrity_rejection(
+    agent, monkeypatch, provenance_shape
+):
+    from tools import tool_search
+    from tools.registry import registry
+
+    payload = {RESERVED: {"version": 1, "replayable": False}}
+    if provenance_shape == "direct":
+        invalid = _mock_tool_call(
+            name="terminal", arguments=json.dumps(payload), call_id="invalid"
+        )
+    elif provenance_shape == "deferred":
+        tool_name = "mcp__mid_batch_integrity__run"
+        registry.register(
+            name=tool_name,
+            toolset="mid-batch-integrity",
+            schema={
+                "name": tool_name,
+                "description": "probe",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda args, **kwargs: "should not run",
+        )
+        invalid = _mock_tool_call(
+            name=tool_search.TOOL_CALL_NAME,
+            arguments=json.dumps(
+                {"name": tool_name, "arguments": json.dumps(payload)}
+            ),
+            call_id="invalid",
+        )
+    else:
+        tool_name = "mid_batch_schema_integrity_probe"
+        registry.register(
+            name=tool_name,
+            toolset="mid-batch-integrity",
+            schema={
+                "name": tool_name,
+                "description": "probe",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"items": {"type": "array"}},
+                },
+            },
+            handler=lambda args, **kwargs: "should not run",
+        )
+        invalid = _mock_tool_call(
+            name=tool_name,
+            arguments=json.dumps({"items": json.dumps([payload])}),
+            call_id="invalid",
+        )
+
+    valid = _mock_tool_call(
+        name="web_search", arguments=json.dumps({"query": "Hermes"}), call_id="valid"
+    )
+    message = _mock_assistant_msg(content="", tool_calls=[valid, invalid])
+    messages = []
+    flushes = []
+    monkeypatch.setattr(
+        "agent.tool_executor._flush_session_db_after_tool_progress",
+        lambda _agent, current, **_kwargs: flushes.append(
+            [entry["tool_call_id"] for entry in current]
+        )
+        or True,
+    )
+
+    def interrupt_after_first(*_args, **_kwargs):
+        agent._interrupt_requested = True
+        return "ok"
+
+    with patch("run_agent.handle_function_call", side_effect=interrupt_after_first) as dispatch:
+        agent._execute_tool_calls_sequential(message, messages, "task-1")
+
+    dispatch.assert_called_once()
+    assert flushes == [["valid"], ["valid", "invalid"]]
+    assert [entry["tool_call_id"] for entry in messages] == ["valid", "invalid"]
+    assert messages[0]["content"] == "ok"
+    rejected = json.loads(messages[1]["content"])
+    assert rejected["error_type"] == "incomplete_historical_tool_arguments"
+    assert messages[1]["effect_disposition"] == "none"
 
 
 @pytest.mark.parametrize("concurrent", [False, True])

@@ -1303,11 +1303,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
         return
 
-    # ── Logging / callbacks ──────────────────────────────────────────
-    tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
-    if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
-        print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
-
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
     results = [None] * num_tools
@@ -1422,6 +1417,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         and not _is_incomplete_tool_arguments_error_result(scope_block)
     ]
     runnable_names_str = ", ".join(name for _, _, name, _, _ in runnable_calls)
+
+    # Integrity-only batches are rejection bookkeeping, not concurrent work.
+    if (
+        runnable_calls
+        and not agent.quiet_mode
+        and getattr(agent, "tool_progress_mode", "all") != "off"
+    ):
+        print(
+            f"  ⚡ Concurrent: {len(runnable_calls)} tool calls — "
+            f"{runnable_names_str}"
+        )
 
     # Touch activity only when at least one call can actually execute.
     if runnable_calls:
@@ -3054,24 +3060,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
-        if agent._interrupt_requested and i < len(assistant_message.tool_calls):
-            remaining = len(assistant_message.tool_calls) - i
-            agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
-            for skipped_tc in assistant_message.tool_calls[i:]:
-                skipped_name = skipped_tc.function.name
-                messages.append(make_tool_result_message(
-                    skipped_name,
-                    f"[Tool execution skipped — {skipped_name} was not started. User sent a new message]",
-                    _pairing_tool_call_id(skipped_tc),
-                    effect_disposition="none",
-                ))
-                if not _flush_session_db_after_tool_progress(
-                    agent,
-                    messages,
-                    stage=f"skipped tool result {skipped_name}",
-                ):
-                    return
-            break
+        # Keep iterating after a cooperative interrupt.  The next iteration
+        # classifies integrity before cancellation and persists exactly one
+        # canonical result for that call before advancing.
 
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     # Keep /steer pending until the final post-budget drain below.  The model
