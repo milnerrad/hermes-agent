@@ -274,6 +274,38 @@ class TestKeyedSearchFallback:
 
 class TestKeyedExtractFallback:
     @pytest.mark.asyncio
+    async def test_empty_primary_batch_uses_configured_secondary(self, monkeypatch):
+        urls = ["https://example.com/a", "https://example.com/b"]
+        primary = _Provider("exa", extract_result=[])
+        secondary = _Provider(
+            "tavily",
+            extract_result=[
+                {"url": url, "title": url[-1], "content": f"fallback {url[-1]}"}
+                for url in reversed(urls)
+            ],
+        )
+        _registry(monkeypatch, {"exa": primary, "tavily": secondary})
+        monkeypatch.setattr(
+            web_tools,
+            "_load_web_config",
+            lambda: {
+                "extract_backend": "exa",
+                "fallback_backend": "tavily",
+                "keyless_fallback": False,
+            },
+        )
+
+        async def _allow_all(candidate, **kwargs):
+            return True
+
+        monkeypatch.setattr(web_tools, "async_is_safe_url", _allow_all)
+        result = json.loads(await web_tools.web_extract_tool(urls))["results"]
+
+        assert [row["url"] for row in result] == urls
+        assert [row["content"] for row in result] == ["fallback a", "fallback b"]
+        assert secondary.extract_calls == 1
+
+    @pytest.mark.asyncio
     async def test_failed_batch_uses_configured_secondary_before_keyless(
         self, monkeypatch
     ):
@@ -380,7 +412,7 @@ class TestKeyedExtractFallback:
         assert secondary.extract_calls == 0
 
     @pytest.mark.asyncio
-    async def test_malformed_partial_policy_result_suppresses_fallback(self, monkeypatch):
+    async def test_partial_policy_result_retries_only_exact_missing_url(self, monkeypatch):
         urls = ["https://blocked.example", "https://missing.example"]
         primary = _Provider(
             "exa",
@@ -410,10 +442,13 @@ class TestKeyedExtractFallback:
             return True
 
         monkeypatch.setattr(web_tools, "async_is_safe_url", _allow_all)
-        await web_tools.web_extract_tool(urls)
+        result = json.loads(await web_tools.web_extract_tool(urls))["results"]
 
         assert primary.extract_calls == 1
-        assert secondary.extract_calls == 0
+        assert secondary.extract_calls == 1
+        assert [row["url"] for row in result] == urls
+        assert result[0]["blocked_by_policy"] is True
+        assert result[1]["content"] == "fallback content"
 
     @pytest.mark.asyncio
     async def test_secondary_policy_block_is_preserved_for_keyless_rescue(
@@ -451,7 +486,7 @@ class TestKeyedExtractFallback:
         assert returned == secondary_results
         keyless.assert_not_called()
 
-    def test_keyless_rescue_also_suppresses_malformed_partial_policy_result(self):
+    def test_keyless_rescue_preserves_partial_policy_and_retries_missing_url(self):
         urls = ["https://blocked.example", "https://missing.example"]
         results = [
             {
@@ -460,9 +495,51 @@ class TestKeyedExtractFallback:
                 "blocked_by_policy": True,
             }
         ]
+        rescued = [{"url": urls[1], "content": "rescued"}]
 
-        with patch.object(keyless_mcp, "extract_with_failover") as keyless:
+        with patch.object(
+            keyless_mcp, "extract_with_failover", return_value=rescued
+        ) as keyless:
             returned = web_tools._rescue_extract("exa", urls, results)
 
-        assert returned == results
-        keyless.assert_not_called()
+        assert [row["url"] for row in returned] == urls
+        assert returned[0] == results[0]
+        assert returned[1]["content"] == "rescued"
+        keyless.assert_called_once_with("exa", [urls[1]])
+
+    @pytest.mark.asyncio
+    async def test_configured_fallback_merges_untrusted_batch_by_exact_url(
+        self, monkeypatch
+    ):
+        urls = ["https://a", "https://dup", "https://dup", "https://blocked"]
+        original = [
+            {"url": url, "title": "", "content": "", "error": f"primary {i}"}
+            for i, url in enumerate(urls)
+        ]
+        retried = [
+            {"url": "https://blocked", "error": "Blocked by website policy", "blocked_by_policy": True},
+            {"url": "https://dup", "content": "dup first"},
+            None,
+            {"url": "https://unknown", "content": "must be ignored"},
+            {"url": "https://a", "error": "secondary also failed"},
+            {"url": "https://dup", "content": "dup second"},
+            {"url": "https://dup", "content": "excess duplicate"},
+        ]
+        secondary = _Provider("tavily", extract_result=retried)
+        _registry(monkeypatch, {"tavily": secondary})
+        monkeypatch.setattr(
+            web_tools,
+            "_load_web_config",
+            lambda: {"extract_backend": "exa", "fallback_backend": "tavily"},
+        )
+
+        merged, error = await web_tools._try_fallback_extract("exa", urls, original)
+
+        assert error == ""
+        assert [row["url"] for row in merged] == urls
+        assert merged[0] == original[0]
+        assert [merged[1]["content"], merged[2]["content"]] == [
+            "dup first",
+            "dup second",
+        ]
+        assert merged[3]["blocked_by_policy"] is True
