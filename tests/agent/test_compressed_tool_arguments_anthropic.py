@@ -1,6 +1,6 @@
 import json
 
-from agent.anthropic_adapter import _convert_assistant_message
+from agent.anthropic_message_convert import _convert_assistant_message
 from agent.tool_argument_integrity import (
     INCOMPLETE_TOOL_ARGUMENTS_KEY,
     neutralize_completed_incomplete_tool_calls,

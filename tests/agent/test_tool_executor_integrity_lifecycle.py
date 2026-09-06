@@ -32,7 +32,7 @@ def test_initial_rejection_skips_hooks_and_callbacks(agent, monkeypatch, concurr
     payload = {RESERVED: {"version": 1, "replayable": False}}
     call = _mock_tool_call(name="terminal", arguments=json.dumps(payload), call_id="c1")
     messages = []
-    with patch("run_agent.handle_function_call", side_effect=AssertionError("dispatch")):
+    with patch("model_tools.handle_function_call", side_effect=AssertionError("dispatch")):
         _run(agent, concurrent, call, messages)
     assert events == []
     assert len(messages) == 1
@@ -46,7 +46,7 @@ def test_concurrent_integrity_only_batch_skips_concurrent_status(agent, capsys):
     call = _mock_tool_call(name="terminal", arguments=json.dumps(payload), call_id="c1")
     messages = []
 
-    with patch("run_agent.handle_function_call", side_effect=AssertionError("dispatch")):
+    with patch("model_tools.handle_function_call", side_effect=AssertionError("dispatch")):
         _run(agent, True, call, messages)
 
     assert "Concurrent:" not in capsys.readouterr().out
@@ -90,7 +90,7 @@ def test_deferred_rejection_skips_middleware_hooks_and_callbacks(
     outer = json.dumps({"name": tool_name, "arguments": inner})
     call = _mock_tool_call(name=TOOL_CALL_NAME, arguments=outer, call_id="c1")
     messages = []
-    with patch("run_agent.handle_function_call", side_effect=AssertionError("dispatch")):
+    with patch("model_tools.handle_function_call", side_effect=AssertionError("dispatch")):
         _run(agent, concurrent, call, messages)
     assert events == []
     assert len(messages) == 1
@@ -138,7 +138,7 @@ def test_schema_decoded_rejection_skips_lifecycle(agent, monkeypatch, concurrent
         call_id="c1",
     )
     messages = []
-    with patch("run_agent.handle_function_call", side_effect=AssertionError("dispatch")):
+    with patch("model_tools.handle_function_call", side_effect=AssertionError("dispatch")):
         _run(agent, concurrent, call, messages)
     assert events == []
     assert json.loads(messages[0]["content"])["error_type"] == "incomplete_historical_tool_arguments"
@@ -168,7 +168,7 @@ def test_escaped_schema_decoded_marker_skips_lifecycle(agent, monkeypatch, concu
     assert RESERVED not in raw_arguments
     call = _mock_tool_call(name=tool_name, arguments=raw_arguments, call_id="escaped")
     messages = []
-    with patch("run_agent.handle_function_call", side_effect=AssertionError("dispatch")):
+    with patch("model_tools.handle_function_call", side_effect=AssertionError("dispatch")):
         _run(agent, concurrent, call, messages)
     assert events == []
     assert json.loads(messages[0]["content"])["error_type"] == "incomplete_historical_tool_arguments"
@@ -193,7 +193,7 @@ def test_preexisting_interrupt_still_rejects_integrity_before_hooks(
     call = _mock_tool_call(name="terminal", arguments=json.dumps(payload), call_id="c1")
     messages = []
 
-    with patch("run_agent.handle_function_call", side_effect=AssertionError("dispatch")):
+    with patch("model_tools.handle_function_call", side_effect=AssertionError("dispatch")):
         _run(agent, concurrent, call, messages)
 
     assert events == []
@@ -237,7 +237,7 @@ def test_interrupt_rejects_deferred_incomplete_arguments(agent, monkeypatch, con
         call_id="deferred-interrupted",
     )
     messages = []
-    with patch("run_agent.handle_function_call", side_effect=AssertionError("dispatch")):
+    with patch("model_tools.handle_function_call", side_effect=AssertionError("dispatch")):
         _run(agent, concurrent, call, messages)
     assert events == []
     assert json.loads(messages[0]["content"])["error_type"] == "incomplete_historical_tool_arguments"
@@ -256,7 +256,7 @@ def test_preexisting_interrupt_cancels_malformed_json_consistently(
     call = _mock_tool_call(name="terminal", arguments="{broken", call_id="c1")
     messages = []
 
-    with patch("run_agent.handle_function_call", side_effect=AssertionError("dispatch")):
+    with patch("model_tools.handle_function_call", side_effect=AssertionError("dispatch")):
         _run(agent, concurrent, call, messages)
 
     assert len(messages) == 1
@@ -281,7 +281,7 @@ def test_concurrent_preexisting_interrupt_flushes_integrity_rejection(
         lambda _agent, current, **_kwargs: flushes.append(list(current)) or True,
     )
 
-    with patch("run_agent.handle_function_call", side_effect=AssertionError("dispatch")):
+    with patch("model_tools.handle_function_call", side_effect=AssertionError("dispatch")):
         _run(agent, True, call, messages)
 
     assert len(flushes) == 1
@@ -307,7 +307,7 @@ def test_concurrent_preexisting_interrupt_flushes_mixed_results_in_order(
         or True,
     )
 
-    with patch("run_agent.handle_function_call", side_effect=AssertionError("dispatch")):
+    with patch("model_tools.handle_function_call", side_effect=AssertionError("dispatch")):
         agent._execute_tool_calls_concurrent(message, messages, "task-1")
 
     assert flushes == [["v"], ["v", "i"]]
@@ -385,7 +385,7 @@ def test_sequential_mid_batch_interrupt_preserves_later_integrity_rejection(
         agent._interrupt_requested = True
         return "ok"
 
-    with patch("run_agent.handle_function_call", side_effect=interrupt_after_first) as dispatch:
+    with patch("model_tools.handle_function_call", side_effect=interrupt_after_first) as dispatch:
         agent._execute_tool_calls_sequential(message, messages, "task-1")
 
     dispatch.assert_called_once()
@@ -413,7 +413,7 @@ def test_clean_arguments_skip_schema_integrity_preview(
             AssertionError("schema preview should be skipped")
         ),
     )
-    with patch("run_agent.handle_function_call", return_value="ok"):
+    with patch("model_tools.handle_function_call", return_value="ok"):
         _run(agent, concurrent, call, messages)
     assert len(messages) == 1
     assert messages[0]["content"] == "ok"

@@ -1577,9 +1577,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         for pc in parsed_calls
         if pc.parse_error is None and _integrity_result_for_call(pc) is None
     ]
-    tool_names_str = ", ".join(pc.name for pc in parsed_calls)
-    if _tool_progress_enabled(agent):
-        print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
+    if runnable_calls and _tool_progress_enabled(agent):
+        runnable_names = ", ".join(pc.name for pc in runnable_calls)
+        print(
+            f"  ⚡ Concurrent: {len(runnable_calls)} tool calls — {runnable_names}"
+        )
 
     # Resolved before the batch is built so the start-order gate can clamp under the deadline.
     timeout_s = _resolve_concurrent_tool_timeout()

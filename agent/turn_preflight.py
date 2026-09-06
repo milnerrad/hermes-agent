@@ -374,4 +374,25 @@ def compress_after_tool_results(
             # stale in-place flag the helper could seed unpersisted rows.
             if _pruned_n and _pruned_msgs is not messages:
                 messages = _pruned_msgs
+                # Pruning may remove the full bodies that retrieval-dedup stubs
+                # reference. Invalidate per-task trackers only after a committed
+                # prune so the next explicit read/view returns full content.
+                try:
+                    from tools.skills_tool import reset_skill_view_dedup
+
+                    reset_skill_view_dedup(effective_task_id)
+                except Exception:
+                    logger.debug(
+                        "failed to reset skill_view dedup after proactive prune",
+                        exc_info=True,
+                    )
+                try:
+                    from tools.file_tools_read_tracking import reset_file_dedup
+
+                    reset_file_dedup(effective_task_id)
+                except Exception:
+                    logger.debug(
+                        "failed to reset read_file dedup after proactive prune",
+                        exc_info=True,
+                    )
     return _verdict(False)

@@ -179,14 +179,29 @@ def test_trigger_phrase_in_multiline_missing_path_does_not_enable_pcre2(
     assert "--pcre2" not in commands[0]
 
 
-def test_pcre2_retry_preserves_offset_and_limit(corpus):
+def test_pcre2_retry_preserves_offset_and_limit(corpus, monkeypatch):
     ops = _ops(corpus)
-    full = _rg(
-        ops,
-        r"alpha (?=foo)",
-        corpus,
-        limit=2,
+    commands = []
+    parser_error = (
+        "rg: regex parse error:\n"
+        "error: look-around, including look-ahead and look-behind, is not supported\n"
+        "consider enabling PCRE2 with the --pcre2 flag, which can handle "
+        "backreferences and look-around."
     )
+    payload = (
+        f"{corpus / 'a.txt'}:1:alpha foo omega\n"
+        f"{corpus / 'sub' / 'b.py'}:1:alpha foo foo omega\n"
+    )
+
+    def deterministic_retry(command, *args, **kwargs):
+        commands.append(command)
+        if " --pcre2 " in command:
+            return ExecuteResult(stdout=payload, exit_code=0)
+        return ExecuteResult(stdout=parser_error, exit_code=2)
+
+    monkeypatch.setattr(ops, "_exec", deterministic_retry)
+    monkeypatch.setattr(ops, "_rg_supports_pcre2", lambda _executable="rg": True)
+
     result = _rg(
         ops,
         r"alpha (?=foo)",
@@ -195,11 +210,12 @@ def test_pcre2_retry_preserves_offset_and_limit(corpus):
         offset=1,
     )
 
-    assert full.error is None
     assert result.error is None
     assert result.total_count == 2
     assert len(result.matches) == 1
-    assert result.matches[0] == full.matches[1]
+    assert result.matches[0].path.endswith("sub/b.py")
+    assert len(commands) == 2
+    assert "head -n 2" in commands[1]
 
 
 def test_pcre2_retry_reuses_original_shell_template_and_timeout(corpus, monkeypatch):
