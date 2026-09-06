@@ -363,6 +363,12 @@ def _ordered_extract_batch(urls: list, rows: object) -> list | None:
     return [mapped[i] for i in range(len(urls))] if len(mapped) == len(urls) else None
 
 
+def _normalize_extract_batch(urls: list, rows: object) -> list:
+    """Return exact request order, filling missing provider rows with failures."""
+    mapped = _map_extract_rows_by_url(urls, list(range(len(urls))), rows)
+    return [mapped.get(i, _result_entry(url, _NO_RESULT_ERROR)) for i, url in enumerate(urls)]
+
+
 def _extract_failure_message(rows: object) -> str:
     candidates = rows if isinstance(rows, list) else []
     return next(
@@ -392,17 +398,11 @@ async def _try_fallback_extract(
     if provider is None:
         return None, ""
 
-    ordered = _ordered_extract_batch(urls, results)
-    if ordered is not None:
-        retry_indices = [
-            i for i, row in enumerate(ordered)
-            if row.get("error") and not _policy_blocked_result(row)
-        ]
-    else:
-        rows = results if isinstance(results, list) else []
-        if any(_policy_blocked_result(row) for row in rows):
-            return None, ""  # identity is incomplete: fail closed on policy
-        retry_indices = list(range(len(urls)))
+    ordered = _normalize_extract_batch(urls, results)
+    retry_indices = [
+        i for i, row in enumerate(ordered)
+        if row.get("error") and not _policy_blocked_result(row)
+    ]
     if not retry_indices:
         return None, ""
 
@@ -428,24 +428,11 @@ async def _try_fallback_extract(
                     backend_error=(original_error or "unknown error")[:300],
                 )
 
-    if ordered is not None:
-        merged = list(ordered)
-        for index, row in mapped.items():
-            if _policy_blocked_result(row) or not row.get("error"):
-                merged[index] = row
-        if any(_policy_blocked_result(row) or not row.get("error") for row in mapped.values()):
-            return merged, ""
-    elif len(mapped) == len(urls):
-        complete = [mapped[i] for i in range(len(urls))]
-        if any(_policy_blocked_result(row) or not row.get("error") for row in complete):
-            return complete, ""
-    elif any(_policy_blocked_result(row) for row in mapped.values()):
-        # A short secondary may still reveal an exact redirect-time refusal.
-        original = _map_extract_rows_by_url(urls, list(range(len(urls))), results)
-        merged = [original.get(i, _result_entry(url, _NO_RESULT_ERROR)) for i, url in enumerate(urls)]
-        for index, row in mapped.items():
-            if _policy_blocked_result(row) or not row.get("error"):
-                merged[index] = row
+    merged = list(ordered)
+    for index, row in mapped.items():
+        if _policy_blocked_result(row) or not row.get("error"):
+            merged[index] = row
+    if any(_policy_blocked_result(row) or not row.get("error") for row in mapped.values()):
         return merged, ""
 
     fallback_error = next(
@@ -468,22 +455,13 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
     """Keyless rescue with exact URL mapping and policy-preserving positional merge."""
     from plugins.web.keyless_mcp import extract_with_failover
 
-    ordered = _ordered_extract_batch(urls, results)
-    if ordered is not None:
-        rescue_indices = [
-            i for i, row in enumerate(ordered)
-            if row.get("error") and not _policy_blocked_result(row)
-        ]
-    else:
-        raw_rows = results if isinstance(results, list) else []
-        if any(_policy_blocked_result(row) for row in raw_rows):
-            # With incomplete identity, a refusal cannot be partitioned safely.
-            # Configured fallback normalizes identified policy rows to a complete
-            # batch before continuation reaches this function.
-            return results
-        rescue_indices = list(range(len(urls)))
+    ordered = _normalize_extract_batch(urls, results)
+    rescue_indices = [
+        i for i, row in enumerate(ordered)
+        if row.get("error") and not _policy_blocked_result(row)
+    ]
     if not rescue_indices:
-        return ordered if ordered is not None else results
+        return ordered
 
     rescue_urls = [urls[i] for i in rescue_indices]
     original_error = _extract_failure_message(results)
@@ -504,12 +482,10 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
             metadata = row.setdefault("metadata", {})
             if isinstance(metadata, dict):
                 metadata.update(rescued_from=provider_name, backend_error=original_error[:300])
-    if ordered is not None:
-        merged = list(ordered)
-        for index, row in replacements.items():
-            merged[index] = row
-        return merged
-    return [mapped[i] for i in range(len(urls))] if len(mapped) == len(urls) else results
+    merged = list(ordered)
+    for index, row in replacements.items():
+        merged[index] = row
+    return merged
 
 
 def _merge_in_order(
