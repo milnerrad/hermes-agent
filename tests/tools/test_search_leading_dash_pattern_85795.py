@@ -85,10 +85,12 @@ class TestRgCommandIncludesEndOfOptionsSeparator:
             stdout = ""
 
         def _fake_exec(command, cwd=None, timeout=None, **kwargs):
-            captured["command"] = command
+            if " -- '-foo'" in command:
+                captured["command"] = command
             return _FakeResult()
 
         monkeypatch.setattr(ops, "_exec", _fake_exec)
+        monkeypatch.setattr(ops, "_path_exists_probe", lambda _path: "exists")
 
         ops.search("-foo", path=".", target="content")
 
@@ -120,10 +122,12 @@ class TestGrepCommandIncludesEndOfOptionsSeparator:
             stdout = ""
 
         def _fake_exec(command, cwd=None, timeout=None, **kwargs):
-            captured["command"] = command
+            if " -- '-foo'" in command:
+                captured["command"] = command
             return _FakeResult()
 
         monkeypatch.setattr(ops, "_exec", _fake_exec)
+        monkeypatch.setattr(ops, "_path_exists_probe", lambda _path: "exists")
 
         ops.search("-foo", path=".", target="content")
 
