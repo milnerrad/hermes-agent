@@ -1378,12 +1378,18 @@ def _contains_unsafe_gateway_action(
             # outer direct scan; do not reinterpret runbook prose as shell source here.
             continue
         if delimiter_quoted and receiver_kind == "non_shell":
-            if recurse(
-                body,
-                cwd,
-                nested_visited=set(visited),
-                explicit=True,
-            ):
+            # Interpreter heredocs (Python, AppleScript, etc.) are executable
+            # source, so retain direct lifecycle detection.  Do not feed the
+            # body through the referenced-script walker: ordinary source
+            # literals such as ``Path('/tmp/file')`` are data, not shell
+            # script references.  Shell commands embedded in the source are
+            # still caught by the direct scanner above.
+            # Preserve explicit programmatic shell/script launches in source,
+            # while leaving ordinary path literals inert.
+            for match in re.finditer(r"(?:os\.system|subprocess\.(?:run|call|Popen))\(\s*['\"]([^'\"]+)", body):
+                if recurse(f"sh {match.group(1)}", cwd):
+                    return True
+            if _direct_lifecycle_scan(body):
                 return True
             continue
         if not delimiter_quoted:
@@ -1432,8 +1438,7 @@ def _contains_unsafe_gateway_action(
                 read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
             )
             if unsafe:
-                if executed:
-                    return True
+                return True
                 continue
         if not script_text:
             continue
