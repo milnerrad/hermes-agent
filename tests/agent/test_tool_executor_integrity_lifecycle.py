@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.run_agent.test_run_agent import agent, _mock_assistant_msg, _mock_tool_call
+from tests.agent.test_run_agent import agent, _mock_assistant_msg, _mock_tool_call
 
 RESERVED = "__hermes_incomplete_tool_arguments__"
 
