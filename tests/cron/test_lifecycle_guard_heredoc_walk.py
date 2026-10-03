@@ -43,75 +43,115 @@ def test_unquoted_heredoc_body_path_still_walked(tmp_path):
     assert guard(f"cat > /tmp/x <<EOF\n{big}\nEOF", cwd=str(tmp_path)) is True
 
 
-def test_inert_heredoc_body_script_path_still_read(tmp_path):
-    """Masking hides the body from the *executed* view only: a lifecycle script named inside a
-    Python body is still handed to ``os.system`` at runtime, so its contents must still be read."""
-    script = tmp_path / "restart.sh"
-    script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
-    command = f"python3 - <<'PY'\nimport os\nos.system('{script}')\nPY"
-    assert guard(command, cwd=str(tmp_path)) is True
+@pytest.mark.parametrize(
+    ("invocation", "target_name", "remote", "expected"),
+    [
+        pytest.param("os.system('{target}')", "restart.sh", False, True, id="os-system-path-only"),
+        pytest.param(
+            "os.system('bash {target}')",
+            "restart.sh",
+            False,
+            True,
+            id="os-system-command-string",
+        ),
+        pytest.param(
+            'os.system(\'bash "{target}"\')',
+            "restart helper.sh",
+            False,
+            True,
+            id="os-system-command-string-quoted-spaced-path",
+        ),
+        pytest.param(
+            "subprocess.run('bash {target}', shell=True)",
+            "restart.sh",
+            True,
+            True,
+            id="subprocess-command-string-shell-true",
+        ),
+        pytest.param(
+            "subprocess.run(['bash', '{target}'], check=True)",
+            "restart.sh",
+            False,
+            True,
+            id="list-argv-unspaced-path",
+        ),
+        pytest.param(
+            "subprocess.run(['bash', '{target}'], check=True)",
+            "restart helper.sh",
+            False,
+            True,
+            id="list-argv-spaced-path",
+        ),
+        pytest.param(
+            "subprocess.run(('bash', '{target}'), check=True)",
+            "restart.sh",
+            True,
+            True,
+            id="tuple-argv-unspaced-path",
+        ),
+        pytest.param(
+            "subprocess.run(('bash', '{target}'), check=True)",
+            "restart helper.sh",
+            True,
+            True,
+            id="tuple-argv-spaced-path",
+        ),
+        pytest.param(
+            "subprocess.run(['printf', 'release notes'], check=True)",
+            None,
+            False,
+            False,
+            id="benign-list-argv-spaced-data",
+        ),
+        pytest.param(
+            "subprocess.run(('printf', 'release notes'), check=True)",
+            None,
+            False,
+            False,
+            id="benign-tuple-argv-spaced-data",
+        ),
+        pytest.param(
+            'os.system(\'printf "release notes"\')',
+            None,
+            False,
+            False,
+            id="benign-command-text",
+        ),
+    ],
+)
+def test_inert_python_programmatic_command_matrix(
+    tmp_path,
+    invocation,
+    target_name,
+    remote,
+    expected,
+):
+    """Programmatic command strings retain shell text; explicit argv retains boundaries."""
+    target = None
+    if target_name is not None:
+        target = f"/remote/{target_name}" if remote else str(tmp_path / target_name)
+        if not remote:
+            (tmp_path / target_name).write_text(
+                "#!/bin/sh\nhermes gateway restart\n",
+                encoding="utf-8",
+            )
+        invocation = invocation.format(target=target)
 
-
-def test_inert_heredoc_subprocess_argv_script_path_still_read(tmp_path):
-    script = tmp_path / "restart-helper.sh"
-    script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
-    command = (
-        "python3 - <<'PY'\n"
-        "import subprocess\n"
-        f"subprocess.run(['bash', '{script}'], check=True)\n"
-        "PY"
-    )
-    assert guard(command, cwd=str(tmp_path)) is True
-
-
-def test_inert_heredoc_subprocess_list_argv_preserves_spaced_script_path(tmp_path):
-    script = tmp_path / "restart helper.sh"
-    script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
-    command = (
-        "python3 - <<'PY'\n"
-        "import subprocess\n"
-        f"subprocess.run(['bash', '{script}'], check=True)\n"
-        "PY"
-    )
-    assert guard(command, cwd=str(tmp_path)) is True
-
-
-def test_inert_heredoc_subprocess_tuple_argv_preserves_remote_spaced_script_path(tmp_path):
-    remote_script = "/remote/restart helper.sh"
     requested: list[str] = []
 
     def read_remote_script(path: str):
         requested.append(path)
-        if path == remote_script:
+        if path == target:
             return "#!/bin/sh\nhermes gateway restart\n"
         return None
 
-    command = (
-        "python3 - <<'PY'\n"
-        "import subprocess\n"
-        f"subprocess.run(('bash', '{remote_script}'), check=True)\n"
-        "PY"
-    )
+    command = f"python3 - <<'PY'\nimport os\nimport subprocess\n{invocation}\nPY"
     assert guard(
         command,
         cwd=str(tmp_path),
         read_remote_script=read_remote_script,
-    ) is True
-    assert requested == [remote_script]
-
-
-@pytest.mark.parametrize(
-    "argv",
-    ["['printf', 'release notes']", "('printf', 'release notes')"],
-)
-def test_inert_heredoc_subprocess_spaced_data_argument_stays_benign(tmp_path, argv):
-    command = (
-        "python3 - <<'PY'\n"
-        "import subprocess\n"
-        f"subprocess.run({argv}, check=True)\n"
-        "PY"
-    )
-    assert guard(command, cwd=str(tmp_path)) is False
+    ) is expected
+    assert requested == ([target] if remote else [])
 
 
 def test_mentioned_data_file_that_cannot_be_scanned_is_not_a_verdict(tmp_path, monkeypatch):

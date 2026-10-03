@@ -1579,8 +1579,19 @@ def _contains_unsafe_gateway_action(
                 body,
                 flags=re.DOTALL,
             ):
-                arguments = re.findall(r"['\"]([^'\"]+)['\"]", match.group(1))
-                if arguments and recurse(shlex.join(arguments), cwd, nested_executed=True):
+                expression = match.group(1).lstrip()
+                if expression.startswith(("[", "(")):
+                    arguments = re.findall(r"['\"]([^'\"]+)['\"]", expression)
+                    nested_command = shlex.join(arguments) if arguments else ""
+                else:
+                    command_string = re.match(
+                        r"(?P<quote>['\"])(?P<command>(?:\\.|(?!(?P=quote)).)*)"
+                        r"(?P=quote)\s*(?:,|$)",
+                        expression,
+                        flags=re.DOTALL,
+                    )
+                    nested_command = command_string.group("command") if command_string else ""
+                if nested_command and recurse(nested_command, cwd, nested_executed=True):
                     return True
             if recurse(body, cwd, explicit=True, nested_executed=False):
                 return True
