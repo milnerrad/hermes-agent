@@ -373,6 +373,78 @@ def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
     assert result.get("notify_on_complete") is True
 
 
+@pytest.mark.parametrize(
+    ("notify_on_complete", "watch_patterns"),
+    [
+        (True, None),
+        (False, ["checks passed"]),
+        (True, ["checks passed"]),
+    ],
+)
+def test_delegated_child_suppresses_background_notifications(
+    monkeypatch, notify_on_complete, watch_patterns,
+):
+    """A child's completion must not wake or replace the parent gateway session."""
+    from types import SimpleNamespace
+
+    from agent.delegation_context import delegated_child_context
+    from tools import terminal_tool_background as background
+
+    process = SimpleNamespace(
+        id="proc_child_watch",
+        pid=4242,
+        notify_on_complete=False,
+        watcher_platform="telegram",
+        watcher_chat_id="chat-1",
+        watcher_user_id="user-1",
+        watcher_user_name="Darren",
+        watcher_thread_id="thread-1",
+        watcher_message_id="message-1",
+        watcher_interval=0,
+        parent_session_id="child-session",
+    )
+    async_args = []
+    registered = []
+    monkeypatch.setattr(background, "_spawn", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(
+        background,
+        "_apply_async_support",
+        lambda _process, _result, notify, patterns: (
+            async_args.append((notify, patterns)) or (notify, patterns)
+        ),
+    )
+    monkeypatch.setattr(
+        background,
+        "_register_completion_watcher",
+        lambda *_args, **_kwargs: registered.append((_args, _kwargs)),
+    )
+
+    with delegated_child_context("child-session"):
+        result = json.loads(background.spawn_background_process(
+            command="run checks",
+            env=SimpleNamespace(),
+            env_type="local",
+            effective_task_id="child-task",
+            task_id="child-task",
+            session_key="parent-route",
+            workdir=None,
+            cwd="/tmp",
+            effective_pty=False,
+            notify_on_complete=notify_on_complete,
+            watch_patterns=watch_patterns,
+            approval_note=None,
+            pty_disabled_reason=None,
+        ))
+
+    assert result.get("notify_on_complete") is False
+    assert "watch_patterns" not in result
+    assert "subagent_note" in result
+    assert async_args == [(False, None)]
+    assert registered == []
+    assert process.notify_on_complete is False
+    assert not getattr(process, "watch_patterns", [])
+
+
 def test_foreground_command_does_not_emit_hint(monkeypatch, tmp_path):
     """Hint only applies to background processes — foreground returns its
     result synchronously and the agent always sees the outcome."""
