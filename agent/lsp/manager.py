@@ -30,9 +30,11 @@ logger = logging.getLogger("agent.lsp.manager")
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
 _DELTA_BASELINE_CAP = 256  # per-file pre-write snapshots; paths never written again would otherwise live forever (#62950)
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
+DIAGNOSTICS_TIMEOUT_COOLDOWN = 30.0
 
 _Key = Tuple[str, str]
 _Diags = List[Dict[str, Any]]
+_LSP_UNAVAILABLE = object()
 
 
 def _float_or(value: Any, default: float) -> float:
@@ -159,6 +161,14 @@ class LSPService:
         self._broken: Dict[_Key, float] = {}
         self._spawning: Dict[_Key, asyncio.Future] = {}
         self._last_used: Dict[_Key, float] = {}
+        # A live-but-slow server must not charge every edit the full diagnostics wait.
+        # Values are monotonic retry deadlines; unlike ``_broken``, these pairs recover.
+        self._diagnostics_degraded_until: Dict[_Key, float] = {}
+        # An expired cooldown is half-open: exactly one caller may probe while peers skip.
+        self._diagnostics_probe_inflight: set[_Key] = set()
+        # Paths whose pre-write baseline was skipped. A later recovery verdict may close
+        # the circuit, but cannot safely be attributed to that edit as newly introduced.
+        self._skipped_delta_baselines: set[str] = set()
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
         # abs file path → diagnostics snapshot taken immediately before a write.
@@ -293,7 +303,13 @@ class LSPService:
     def snapshot_baseline(self, file_path: str) -> None:
         """Snapshot current diagnostics for ``file_path`` as the delta baseline (call BEFORE a write).
         Best-effort: failures are swallowed so a flaky server can't break a write, but they mark the pair broken."""
+        abs_path = os.path.abspath(file_path)
         if not self.enabled_for(file_path):
+            return
+        if self._skip_degraded_diagnostics(file_path):
+            self._set_delta_baseline(abs_path, [])
+            with self._state_lock:
+                self._skipped_delta_baselines.add(abs_path)
             return
         try:
             # Outer join budget must exceed the inner wait or a slow-but-alive server gets falsely
@@ -305,11 +321,25 @@ class LSPService:
             logger.debug("baseline snapshot failed for %s: %s", file_path, e)
             self._mark_broken_for_file(file_path, e)
             diags = []
-        self._set_delta_baseline(os.path.abspath(file_path), diags or [])
+        if diags is _LSP_UNAVAILABLE:
+            with self._state_lock:
+                self._skipped_delta_baselines.discard(abs_path)
+            diags = []
+        elif diags is None:
+            srv = find_server_for_file(file_path)
+            if srv is not None:
+                eventlog.log_timeout(srv.server_id, file_path, kind="fresh baseline diagnostics")
+            self._degrade_diagnostics(file_path)
+            with self._state_lock:
+                self._skipped_delta_baselines.add(abs_path)
+        else:
+            self._clear_diagnostics_degraded(file_path)
+            with self._state_lock:
+                self._skipped_delta_baselines.discard(abs_path)
+        self._set_delta_baseline(abs_path, diags or [])
 
     def _set_delta_baseline(self, abs_path: str, diags: _Diags) -> None:
-        """Store a baseline, refreshing recency (pop + reinsert) so eviction tracks write order.
-        Callers run on arbitrary threads; the multi-step mutation needs the lock (callers don't hold it)."""
+        """Store a baseline, refreshing recency so eviction tracks write order."""
         with self._state_lock:
             self._delta_baseline.pop(abs_path, None)
             self._delta_baseline[abs_path] = diags
@@ -327,9 +357,17 @@ class LSPService:
         first, so pre-existing diagnostics that merely moved don't look introduced by this edit.
         ``[]`` when LSP is disabled, nothing matches, or the server can't be spawned.
         """
+        abs_path = os.path.abspath(file_path)
         if not self.enabled_for(file_path):
+            with self._state_lock:
+                self._skipped_delta_baselines.discard(abs_path)
             return []
-        server_id = self._server_for(file_path).server_id  # enabled_for guarantees a match
+        server = self._server_for(file_path)
+        if server is None:  # defensive: enabled_for normally guarantees a match
+            return []
+        server_id = server.server_id
+        if self._skip_degraded_diagnostics(file_path):
+            return []
         try:
             budget = self._wait_budget(file_path)
             t = timeout if timeout is not None else budget + 2.0
@@ -342,12 +380,28 @@ class LSPService:
                 eventlog.log_server_error(server_id, file_path, e)
                 logger.debug("LSP diagnostics fetch failed for %s: %s", file_path, e)
             self._mark_broken_for_file(file_path, e)
+            with self._state_lock:
+                self._skipped_delta_baselines.discard(abs_path)
+            return []
+        if diags is _LSP_UNAVAILABLE:
+            with self._state_lock:
+                self._skipped_delta_baselines.discard(abs_path)
             return []
         if diags is None:
             # Server alive but no verdict on the post-edit content in budget (common for tsserver on big
             # projects).  Report "no data" rather than stale stores — that would be the ghost-diagnostics
             # bug.  Not marked broken: slow is not dead.
             eventlog.log_timeout(server_id, file_path, kind="fresh diagnostics")
+            self._degrade_diagnostics(file_path)
+            return []
+        self._clear_diagnostics_degraded(file_path)
+        with self._state_lock:
+            baseline_was_skipped = abs_path in self._skipped_delta_baselines
+            self._skipped_delta_baselines.discard(abs_path)
+        if baseline_was_skipped and delta:
+            # This fresh verdict can close the circuit, but without a pre-edit baseline
+            # it cannot safely say which diagnostics this edit introduced.
+            self._set_delta_baseline(abs_path, list(diags))
             return []
         if delta:
             diags = self._apply_delta(file_path, diags, line_shift)
@@ -356,6 +410,41 @@ class LSPService:
         else:
             eventlog.log_clean(server_id, file_path)
         return diags
+
+    def _skip_degraded_diagnostics(self, file_path: str) -> bool:
+        """Skip all LSP edit notifications while this server/workspace pair cools down."""
+        srv = find_server_for_file(file_path)
+        key = self._broken_key(srv, file_path) if srv is not None else None
+        if key is None:
+            return False
+        now = time.monotonic()
+        with self._state_lock:
+            retry_at = self._diagnostics_degraded_until.get(key)
+            if retry_at is None:
+                return False
+            if retry_at <= now and key not in self._diagnostics_probe_inflight:
+                self._diagnostics_probe_inflight.add(key)
+                return False
+        eventlog.log_degraded_skip(key[0], file_path, max(0.0, retry_at - now))
+        return True
+
+    def _degrade_diagnostics(self, file_path: str) -> None:
+        """Open the bounded timeout cooldown for the file's server/workspace pair."""
+        srv = find_server_for_file(file_path)
+        key = self._broken_key(srv, file_path) if srv is not None else None
+        if key is None:
+            return
+        with self._state_lock:
+            self._diagnostics_degraded_until[key] = time.monotonic() + DIAGNOSTICS_TIMEOUT_COOLDOWN
+            self._diagnostics_probe_inflight.discard(key)
+
+    def _clear_diagnostics_degraded(self, file_path: str) -> None:
+        srv = find_server_for_file(file_path)
+        key = self._broken_key(srv, file_path) if srv is not None else None
+        if key is not None:
+            with self._state_lock:
+                self._diagnostics_degraded_until.pop(key, None)
+                self._diagnostics_probe_inflight.discard(key)
 
     def _apply_delta(self, file_path: str, diags: _Diags, line_shift: Optional[Callable[[int], Optional[int]]]) -> _Diags:
         """Drop diagnostics present in the pre-write baseline, then roll the baseline forward."""
@@ -392,6 +481,9 @@ class LSPService:
         with self._state_lock:
             client = self._clients.pop(ckey, None)
             self._last_used.pop(ckey, None)
+            self._diagnostics_degraded_until.pop(key, None)
+            self._diagnostics_probe_inflight.discard(key)
+            self._skipped_delta_baselines.discard(os.path.abspath(file_path))
         if client is not None:
             try:
                 # Fire-and-forget shutdown — we're already on a slow path.
@@ -431,23 +523,24 @@ class LSPService:
 
     # ---- async internals ----
 
-    async def _snapshot_async(self, file_path: str, budget: Optional[float] = None) -> _Diags:
-        # No fresh data for the pre-edit content → empty baseline.  Safe: the delta
-        # filter then removes less, never more.  Never seed from stale stores.
-        return await self._open_and_wait_async(file_path, snapshot=True, budget=budget) or []
+    async def _snapshot_async(self, file_path: str, budget: Optional[float] = None) -> Any:
+        # Preserve ``None`` for no fresh pre-edit verdict so the synchronous caller can
+        # degrade the pair. It still records an empty baseline, which removes less, never more.
+        return await self._open_and_wait_async(file_path, snapshot=True, budget=budget)
 
     async def _open_and_wait_async(
         self, file_path: str, *, snapshot: bool = False, budget: Optional[float] = None,
-    ) -> Optional[_Diags]:
-        """Open + wait for FRESH diagnostics: ``[]`` = checked clean, ``None`` = no verdict in budget.
+    ) -> Any:
+        """Open and wait for fresh diagnostics.
 
-        Callers must not substitute stale data for either.  ``snapshot`` mode (pre-write baseline)
-        skips didSave; both modes wait at most ``budget`` (``lsp.wait_timeout`` unless the caller
-        computed a cold-root warm-up budget via :meth:`_wait_budget`).
+        ``[]`` means checked clean, ``None`` means a live client gave no fresh verdict
+        in budget, and ``_LSP_UNAVAILABLE`` means no usable client was obtained.
+        Callers must not substitute stale data for any outcome. ``snapshot`` mode
+        (pre-write baseline) skips didSave and uses the default wait budget.
         """
         client = await self._get_or_spawn(file_path)
         if client is None:
-            return None
+            return _LSP_UNAVAILABLE
         try:
             srv = self._server_for(file_path)
             version = await client.open_file(file_path, language_id=language_id_for(file_path, srv))
@@ -591,6 +684,22 @@ class LSPService:
             clients = [self._clients.pop(key) for key in idle_keys]
             for key in idle_keys:
                 self._last_used.pop(key, None)
+
+            def served_by_reaped_client(key: _Key) -> bool:
+                return any(
+                    key[0] == idle_key[0] and (idle_key[1] == "" or key[1] == idle_key[1])
+                    for idle_key in idle_keys
+                )
+
+            for key in list(self._diagnostics_degraded_until):
+                if served_by_reaped_client(key):
+                    self._diagnostics_degraded_until.pop(key, None)
+                    self._diagnostics_probe_inflight.discard(key)
+            for path in list(self._skipped_delta_baselines):
+                srv = find_server_for_file(path)
+                key = self._broken_key(srv, path) if srv is not None else None
+                if key is not None and served_by_reaped_client(key):
+                    self._skipped_delta_baselines.discard(path)
         if clients:
             eventlog.log_reaped([(c.server_id, c.workspace_root) for c in clients], self._idle_timeout)
             await asyncio.gather(*(client.shutdown() for client in clients), return_exceptions=True)
@@ -665,6 +774,9 @@ class LSPService:
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._diagnostics_degraded_until.clear()
+            self._diagnostics_probe_inflight.clear()
+            self._skipped_delta_baselines.clear()
         await asyncio.gather(*(c.shutdown() for c in clients), return_exceptions=True)
 
 

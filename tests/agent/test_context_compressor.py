@@ -2158,47 +2158,81 @@ class TestThresholdTokensCap:
 
 
 class TestTruncateToolCallArgsJson:
-    """Regression tests for #11762.
+    """Historical large tool arguments are non-replayable and auditable.
 
-    The previous implementation produced invalid JSON by slicing
-    ``function.arguments`` mid-string, which caused non-retryable 400s from
-    strict providers (observed on MiniMax) and stuck long sessions in a
-    re-send loop. The helper here must always emit parseable JSON whose
-    shape matches the original — shrunken, not corrupted.
+    Compression must never turn an executed command, patch, or write into a
+    plausible shortened operation that a later model can copy and execute.
     """
 
     def _helper(self):
         from agent.context_compressor import _truncate_tool_call_args_json
         return _truncate_tool_call_args_json
 
-
-
-
-
-    def test_non_string_leaves_preserved(self):
+    def test_large_args_become_non_replayable_provenance(self):
+        import hashlib
         import json as _json
+
         shrink = self._helper()
-        payload = _json.dumps({
-            "retries": 3,
-            "enabled": True,
-            "timeout": None,
-            "items": [1, 2, 3],
-            "note": "z" * 500,
+        original = _json.dumps({
+            "path": "~/.hermes/skills/shopping/browser-setup-notes.md",
+            "content": "# Shopping Browser Setup Notes\n\n" + "abc " * 400,
         })
-        parsed = _json.loads(shrink(payload))
-        assert parsed["retries"] == 3
-        assert parsed["enabled"] is True
-        assert parsed["timeout"] is None
-        assert parsed["items"] == [1, 2, 3]
-        assert parsed["note"].startswith("z" * 200)
-        assert parsed["note"][200:].startswith(_COMPRESSION_MARKER_PREFIX)
+        shrunk = shrink(original)
+        parsed = _json.loads(shrunk)
 
+        assert set(parsed) == {"__hermes_incomplete_tool_arguments__"}
+        provenance = parsed["__hermes_incomplete_tool_arguments__"]
+        assert provenance["arguments_omitted"] is True
+        assert provenance["replayable"] is False
+        assert provenance["original_chars"] == len(original)
+        assert provenance["sha256"] == hashlib.sha256(original.encode()).hexdigest()
+        assert "path" not in parsed
+        assert "content" not in parsed
+        assert "...[truncated]" not in shrunk
+        assert len(shrunk) < len(original)
 
-
-    def test_pass3_emits_valid_json_for_downstream_provider(self):
-        """End-to-end: Pass 3 must never produce the exact failure payload
-        that caused the 400 loop (unterminated string, missing brace)."""
+    def test_hashing_is_deterministic_for_non_bmp_and_lone_surrogates(self):
+        import hashlib
         import json as _json
+
+        shrink = self._helper()
+        for text in ("😀" * 600, "\ud800" * 600):
+            original = _json.dumps({"content": text}, ensure_ascii=False)
+            provenance = _json.loads(shrink(original))[
+                "__hermes_incomplete_tool_arguments__"
+            ]
+            assert provenance["sha256"] == hashlib.sha256(
+                original.encode("utf-8", errors="surrogatepass")
+            ).hexdigest()
+
+    def test_operation_shapes_are_never_partially_preserved(self):
+        import json as _json
+
+        shrink = self._helper()
+        payloads = [
+            {"command": "python3 -c " + "x" * 800},
+            {"mode": "replace", "path": "/tmp/a", "old_string": "a" * 600, "new_string": "b" * 600},
+            {"path": "/tmp/a", "content": "literal ...[truncated] marker\n" + "z" * 800},
+            {"code": "print('start')\n" + "pass\n" * 300},
+        ]
+        for payload in payloads:
+            parsed = _json.loads(shrink(_json.dumps(payload)))
+            assert set(parsed) == {"__hermes_incomplete_tool_arguments__"}
+            assert parsed["__hermes_incomplete_tool_arguments__"]["replayable"] is False
+
+    def test_short_legitimate_marker_content_is_preserved(self):
+        import json as _json
+
+        original = _json.dumps({"content": "Documentation containing ...[truncated] literally."})
+        assert self._helper()(original) == original
+
+    def test_invalid_non_json_arguments_are_preserved(self):
+        original = "provider-specific non-json arguments"
+        assert self._helper()(original) == original
+
+    def test_pass3_emits_valid_non_replayable_json(self):
+        import json as _json
+
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(
                 model="test/model",
@@ -2212,7 +2246,6 @@ class TestTruncateToolCallArgsJson:
             "path": "~/.hermes/skills/shopping/browser-setup-notes.md",
             "content": huge_content,
         })
-        assert len(args_payload) > 500  # triggers the Pass-3 shrink
         messages = [
             {"role": "user", "content": "please write two files"},
             {"role": "assistant", "content": None, "tool_calls": [
@@ -2226,61 +2259,9 @@ class TestTruncateToolCallArgsJson:
         ]
         result, _ = c._prune_old_tool_results(messages, protect_tail_count=2)
         shrunk = result[1]["tool_calls"][0]["function"]["arguments"]
-        # Must parse — otherwise downstream provider returns 400
         parsed = _json.loads(shrunk)
-        assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].startswith(huge_content[:200])
-        assert parsed["content"][200:].startswith(_COMPRESSION_MARKER_PREFIX)
-
-
-class TestTruncationMarkerNotImitable:
-    """Regression tests for #83714.
-
-    A model replayed its own history containing the bare
-    ``"...[truncated]"`` marker and, in a later turn, imitated it — writing
-    the literal marker into a *new* tool call's ``new_string`` instead of
-    real content. The compressor-side fix is to stop injecting a marker that
-    looks like something the model itself would plausibly write.
-    """
-
-
-    def test_args_without_a_net_gain_leaf_are_left_byte_identical(self):
-        """Leaves the marker would not shrink, and leaves that merely quote the marker.
-
-        Below the break-even (``head_chars`` + marker) replacing a leaf would grow the payload, and
-        re-serialising alone would rewrite compact wire JSON — both read as "this changed" upstream
-        and are counted as reclaimed pressure.
-        """
-        tiny = json.dumps({"new_string": "y" * 201, "pad": "z" * 320})
-        assert _truncate_tool_call_args_json(tiny) == tiny
-        compact = json.dumps({"new_string": "y" * 201, "pad": "z" * 320}, separators=(",", ":"))
-        assert _truncate_tool_call_args_json(compact) == compact
-        # Separator whitespace added by the re-serialise can exceed a single leaf's saving.
-        many_keys = json.dumps(
-            {**{f"k{i}": i for i in range(300)}, "big": "y" * 426}, separators=(",", ":")
-        )
-        assert _truncate_tool_call_args_json(many_keys) == many_keys
-
-        # The guard keys on the marker being the whole tail, so the imitation shape #83714
-        # describes — replayed head+marker followed by new content — is still shrinkable.
-        for leaf in (
-            "x" * 1000 + _COMPRESSION_MARKER_PREFIX + " 5 of 9⟫" + "y" * 500,
-            "x" * 200 + _COMPRESSION_MARKER_PREFIX + " 5 of 9 chars omitted⟫" + "y" * 5000,
-        ):
-            out = _truncate_tool_call_args_json(json.dumps({"new_string": leaf}))
-            assert json.loads(out)["new_string"] == "x" * 200 + _COMPRESSION_MARKER_TEMPLATE.format(
-                omitted=len(leaf) - 200, total=len(leaf)
-            )
-
-    def test_shrunken_leaf_is_head_plus_marker_and_a_fixed_point(self):
-        """Re-shrinking must be a no-op: the marker's counts are its anti-imitation value."""
-        payload = json.dumps({"content": "x" * 2000})
-        once = _truncate_tool_call_args_json(payload)
-        assert len(once) < len(payload)
-        assert json.loads(once)["content"] == "x" * 200 + _COMPRESSION_MARKER_TEMPLATE.format(
-            omitted=1800, total=2000
-        )
-        assert _truncate_tool_call_args_json(once) == once
+        assert set(parsed) == {"__hermes_incomplete_tool_arguments__"}
+        assert parsed["__hermes_incomplete_tool_arguments__"]["replayable"] is False
 
 
 class TestLazyContextResolution:
