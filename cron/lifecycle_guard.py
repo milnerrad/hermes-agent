@@ -1508,14 +1508,21 @@ def _contains_unsafe_gateway_action(
     command: str, *, cwd: Optional[str], depth: int, visited: set[Path], budget: _LifecycleScanBudget,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
     explicit_shell_only: bool = False,
+    executed: bool = True,
 ) -> bool:
+    """Walk executable shell references while retaining lenient scans of inert source mentions.
+
+    ``executed=False`` still permits a positive lifecycle verdict from readable mentioned files,
+    but a refusal to scan such a file is not itself a verdict. Explicit programmatic launches are
+    recursed with ``executed=True`` before the inert source walk, so they remain fail-closed.
+    """
     # Charge BEFORE _direct_lifecycle_scan: every scan in it tokenizes with shlex.
     if not budget.charge_text(command):
-        return _budget_exhausted(budget, "text", depth)
+        return _budget_exhausted(budget, "text", depth) if executed else False
     if _direct_lifecycle_scan(command):
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
-        return True
+        return executed
 
     # Heredoc bodies are input to a receiving command, not additional outer
     # shell lines. Keep the direct scan above on the original text, but only
@@ -1530,6 +1537,7 @@ def _contains_unsafe_gateway_action(
         *,
         nested_visited: Optional[set[Path]] = None,
         explicit: bool = explicit_shell_only,
+        nested_executed: bool = executed,
     ) -> bool:
         return _contains_unsafe_gateway_action(
             text,
@@ -1539,6 +1547,7 @@ def _contains_unsafe_gateway_action(
             budget=budget,
             read_remote_script=read_remote_script,
             explicit_shell_only=explicit,
+            executed=nested_executed,
         )
 
     for payload in _iter_shell_command_payloads(outer_command):
@@ -1565,10 +1574,15 @@ def _contains_unsafe_gateway_action(
             # still caught by the direct scanner above.
             # Preserve explicit programmatic shell/script launches in source,
             # while leaving ordinary path literals inert.
-            for match in re.finditer(r"(?:os\.system|subprocess\.(?:run|call|Popen))\(\s*['\"]([^'\"]+)", body):
-                if recurse(f"sh {match.group(1)}", cwd):
+            for match in re.finditer(
+                r"(?:os\.system|subprocess\.(?:run|call|Popen))\(\s*(.*?)\)",
+                body,
+                flags=re.DOTALL,
+            ):
+                arguments = re.findall(r"['\"]([^'\"]+)['\"]", match.group(1))
+                if arguments and recurse(" ".join(arguments), cwd, nested_executed=True):
                     return True
-            if _direct_lifecycle_scan(body):
+            if recurse(body, cwd, explicit=True, nested_executed=False):
                 return True
             continue
         if not delimiter_quoted:
@@ -1586,6 +1600,8 @@ def _contains_unsafe_gateway_action(
 
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
         if _on_cloud_path(script_path):
+            if not executed:
+                continue
             return _refuse_unreadable(
                 budget,
                 script_path,
@@ -1606,23 +1622,27 @@ def _contains_unsafe_gateway_action(
         if resolved in visited:
             continue
         if not budget.charge_path():
-            return _budget_exhausted(budget, "paths", depth)
+            return _budget_exhausted(budget, "paths", depth) if executed else False
         visited.add(resolved)
         # Never read more than the walk can still afford to tokenize; a file larger than the
         # remainder fails closed exactly like an oversized one.
         script_text, unsafe = _read_referenced_script(script_path, max_bytes=budget.bytes_remaining)
         if unsafe:
-            return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
+            if executed:
+                return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
+            continue
         if script_text is None and read_remote_script is not None:
             # Local path missing; the remote backend's output crosses the same trust boundary as a
             # local read — sanitize identically (binary skip + size fail-closed).
             if not budget.charge_remote_read():
-                return _budget_exhausted(budget, "remote reads", depth)
+                return _budget_exhausted(budget, "remote reads", depth) if executed else False
             script_text, unsafe = _sanitize_remote_script_text(
                 read_remote_script(str(script_path)), max_bytes=budget.bytes_remaining
             )
             if unsafe:
-                return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
+                if executed:
+                    return _refuse_unreadable(budget, script_path, _unreadable_reason(script_path))
+                continue
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's directory, not the cwd.

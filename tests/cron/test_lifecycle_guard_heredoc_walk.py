@@ -52,6 +52,18 @@ def test_inert_heredoc_body_script_path_still_read(tmp_path):
     assert guard(command, cwd=str(tmp_path)) is True
 
 
+def test_inert_heredoc_subprocess_argv_script_path_still_read(tmp_path):
+    script = tmp_path / "restart-helper.sh"
+    script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
+    command = (
+        "python3 - <<'PY'\n"
+        "import subprocess\n"
+        f"subprocess.run(['bash', '{script}'], check=True)\n"
+        "PY"
+    )
+    assert guard(command, cwd=str(tmp_path)) is True
+
+
 def test_mentioned_data_file_that_cannot_be_scanned_is_not_a_verdict(tmp_path, monkeypatch):
     """A file only MENTIONED in an inert body may exhaust the text budget (one >64 KiB line), pull
     in 64+ remote-read misses (a markdown table of paths) or be a live SQLite database: each is

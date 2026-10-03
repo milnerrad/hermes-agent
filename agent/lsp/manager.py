@@ -326,7 +326,7 @@ class LSPService:
                 self._skipped_delta_baselines.discard(abs_path)
             diags = []
         elif diags is None:
-            srv = find_server_for_file(file_path)
+            srv = self._server_for(file_path)
             if srv is not None:
                 eventlog.log_timeout(srv.server_id, file_path, kind="fresh baseline diagnostics")
             self._degrade_diagnostics(file_path)
@@ -413,7 +413,7 @@ class LSPService:
 
     def _skip_degraded_diagnostics(self, file_path: str) -> bool:
         """Skip all LSP edit notifications while this server/workspace pair cools down."""
-        srv = find_server_for_file(file_path)
+        srv = self._server_for(file_path)
         key = self._broken_key(srv, file_path) if srv is not None else None
         if key is None:
             return False
@@ -430,7 +430,7 @@ class LSPService:
 
     def _degrade_diagnostics(self, file_path: str) -> None:
         """Open the bounded timeout cooldown for the file's server/workspace pair."""
-        srv = find_server_for_file(file_path)
+        srv = self._server_for(file_path)
         key = self._broken_key(srv, file_path) if srv is not None else None
         if key is None:
             return
@@ -439,7 +439,7 @@ class LSPService:
             self._diagnostics_probe_inflight.discard(key)
 
     def _clear_diagnostics_degraded(self, file_path: str) -> None:
-        srv = find_server_for_file(file_path)
+        srv = self._server_for(file_path)
         key = self._broken_key(srv, file_path) if srv is not None else None
         if key is not None:
             with self._state_lock:
@@ -696,7 +696,7 @@ class LSPService:
                     self._diagnostics_degraded_until.pop(key, None)
                     self._diagnostics_probe_inflight.discard(key)
             for path in list(self._skipped_delta_baselines):
-                srv = find_server_for_file(path)
+                srv = self._server_for(path)
                 key = self._broken_key(srv, path) if srv is not None else None
                 if key is not None and served_by_reaped_client(key):
                     self._skipped_delta_baselines.discard(path)
