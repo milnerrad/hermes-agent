@@ -1580,7 +1580,7 @@ def _contains_unsafe_gateway_action(
                 flags=re.DOTALL,
             ):
                 arguments = re.findall(r"['\"]([^'\"]+)['\"]", match.group(1))
-                if arguments and recurse(" ".join(arguments), cwd, nested_executed=True):
+                if arguments and recurse(shlex.join(arguments), cwd, nested_executed=True):
                     return True
             if recurse(body, cwd, explicit=True, nested_executed=False):
                 return True

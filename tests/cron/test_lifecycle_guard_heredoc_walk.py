@@ -64,6 +64,56 @@ def test_inert_heredoc_subprocess_argv_script_path_still_read(tmp_path):
     assert guard(command, cwd=str(tmp_path)) is True
 
 
+def test_inert_heredoc_subprocess_list_argv_preserves_spaced_script_path(tmp_path):
+    script = tmp_path / "restart helper.sh"
+    script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
+    command = (
+        "python3 - <<'PY'\n"
+        "import subprocess\n"
+        f"subprocess.run(['bash', '{script}'], check=True)\n"
+        "PY"
+    )
+    assert guard(command, cwd=str(tmp_path)) is True
+
+
+def test_inert_heredoc_subprocess_tuple_argv_preserves_remote_spaced_script_path(tmp_path):
+    remote_script = "/remote/restart helper.sh"
+    requested: list[str] = []
+
+    def read_remote_script(path: str):
+        requested.append(path)
+        if path == remote_script:
+            return "#!/bin/sh\nhermes gateway restart\n"
+        return None
+
+    command = (
+        "python3 - <<'PY'\n"
+        "import subprocess\n"
+        f"subprocess.run(('bash', '{remote_script}'), check=True)\n"
+        "PY"
+    )
+    assert guard(
+        command,
+        cwd=str(tmp_path),
+        read_remote_script=read_remote_script,
+    ) is True
+    assert requested == [remote_script]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    ["['printf', 'release notes']", "('printf', 'release notes')"],
+)
+def test_inert_heredoc_subprocess_spaced_data_argument_stays_benign(tmp_path, argv):
+    command = (
+        "python3 - <<'PY'\n"
+        "import subprocess\n"
+        f"subprocess.run({argv}, check=True)\n"
+        "PY"
+    )
+    assert guard(command, cwd=str(tmp_path)) is False
+
+
 def test_mentioned_data_file_that_cannot_be_scanned_is_not_a_verdict(tmp_path, monkeypatch):
     """A file only MENTIONED in an inert body may exhaust the text budget (one >64 KiB line), pull
     in 64+ remote-read misses (a markdown table of paths) or be a live SQLite database: each is
