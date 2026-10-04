@@ -95,6 +95,46 @@ def completed_tool_call_pairs(
     return pairs
 
 
+def _join_history_content(left: Any, right: Any) -> Any:
+    """Join visible content without flattening canonical multimodal parts."""
+    if isinstance(left, list) or isinstance(right, list):
+        def parts(value: Any) -> list:
+            if isinstance(value, list):
+                return deepcopy(value)
+            return [{"type": "text", "text": value}] if isinstance(value, str) and value else []
+        return parts(left) + parts(right)
+    return "\n".join(value for value in (left, right) if isinstance(value, str) and value)
+
+
+def _visible_assistant_history_content(message: dict[str, Any]) -> Any:
+    """Recover visible Codex text, never native IDs, calls, or reasoning."""
+    content = deepcopy(message.get("content"))
+    canonical_text = (
+        content if isinstance(content, str) else "\n".join(
+            part["text"] for part in content
+            if isinstance(part, dict) and part.get("type") in {"text", "output_text"}
+            and isinstance(part.get("text"), str)
+        ) if isinstance(content, list) else ""
+    )
+    items = message.get("codex_message_items")
+    native_text = []
+    for item in items if isinstance(items, list) else []:
+        if not (
+            isinstance(item, dict) and item.get("type") == "message"
+            and item.get("role") == "assistant"
+            and isinstance(item.get("content"), list)
+        ):
+            continue
+        text = "".join(
+            part["text"] for part in item["content"]
+            if isinstance(part, dict) and part.get("type") in {"text", "output_text"}
+            and isinstance(part.get("text"), str)
+        )
+        if text.strip() and text not in canonical_text:
+            native_text.append(text)
+    return _join_history_content("\n".join(native_text), content)
+
+
 def neutralize_completed_incomplete_tool_calls(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -103,16 +143,16 @@ def neutralize_completed_incomplete_tool_calls(
     Compression provenance belongs in Hermes' canonical transcript so the
     execution guard can fail closed. Once such a call has a tool result,
     replaying the pair on a later provider request makes the marker look like
-    fresh executable arguments. Remove both sides of only those completed,
-    unambiguous pairs and leave a plain note.
+    fresh executable arguments. Strip only those completed, unambiguous call
+    envelopes and preserve their already-retained results as labelled historical
+    text in assistant context, not new user authority.
 
-    An affected assistant turn is rebuilt only from canonical wire-neutral
-    fields (role, visible content, and any remaining ordinary tool calls).
-    Provider-native replay sidecars are deliberately discarded wholesale:
-    after one canonical tool call is removed, their IDs, inputs, signatures,
-    and cross-block ordering can no longer be trusted. The stored transcript
-    remains unchanged. Malformed non-dict history entries are also excluded
-    from the request projection rather than forwarded to provider schemas.
+    Affected and newly adjacent assistant turns are rebuilt from visible content
+    (including Codex message text) and remaining ordinary calls. Provider-native
+    sidecars are discarded: after removing a call or merging turns, their IDs,
+    inputs, signatures, and cross-block ordering can no longer be trusted. The
+    stored transcript remains unchanged. Malformed non-dict history entries are
+    excluded from the request projection rather than forwarded to schemas.
     """
     request_messages = [message for message in messages if isinstance(message, dict)]
     pairs = completed_tool_call_pairs(request_messages)
@@ -126,59 +166,58 @@ def neutralize_completed_incomplete_tool_calls(
     if not neutralized_calls:
         return messages if len(request_messages) == len(messages) else request_messages
     neutralized_results = {pairs[position] for position in neutralized_calls}
-    note_boundaries: set[int] = set()
-    for assistant_index in {position[0] for position in neutralized_calls}:
-        tool_calls = request_messages[assistant_index].get("tool_calls")
-        if not isinstance(tool_calls, list) or not tool_calls:
-            continue
-        positions = [(assistant_index, index) for index in range(len(tool_calls))]
-        if not all(position in neutralized_calls for position in positions):
-            continue
-        result_indices = [pairs[position] for position in positions]
-        boundary = max(result_indices)
-        next_index = boundary + 1
-        while next_index < len(request_messages) and next_index in neutralized_results:
-            next_index += 1
-        if next_index < len(request_messages):
-            following = request_messages[next_index]
-            if following.get("role") == "assistant":
-                note_boundaries.add(boundary)
-
     sanitized: list[dict[str, Any]] = []
+    collapsed_assistant = False
     for message_index, message in enumerate(request_messages):
         if message_index in neutralized_results:
-            if message_index in note_boundaries:
-                sanitized.append({"role": "user", "content": _WIRE_HISTORY_NOTE})
             continue
         if message.get("role") != "assistant":
             sanitized.append(message)
+            collapsed_assistant = False
             continue
 
         tool_calls = message.get("tool_calls")
-        if not isinstance(tool_calls, list):
-            sanitized.append(message)
-            continue
+        calls = tool_calls if isinstance(tool_calls, list) else []
         kept_calls = [
             call
-            for call_index, call in enumerate(tool_calls)
+            for call_index, call in enumerate(calls)
             if (message_index, call_index) not in neutralized_calls
         ]
-        if len(kept_calls) == len(tool_calls):
+        affected = len(kept_calls) != len(calls)
+        if not affected and not collapsed_assistant:
             sanitized.append(message)
             continue
 
-        content = deepcopy(message.get("content"))
-        if isinstance(content, list):
-            content.append({"type": "text", "text": _WIRE_HISTORY_NOTE})
-        elif isinstance(content, str) and content.strip():
-            content = f"{content.rstrip()}\n{_WIRE_HISTORY_NOTE}"
-        else:
-            content = _WIRE_HISTORY_NOTE
+        content = _visible_assistant_history_content(message)
+        if affected:
+            content = _join_history_content(content, _WIRE_HISTORY_NOTE)
+            # Use only already-retained results, in result order. Never reload
+            # original arguments/output or promote tool evidence to a user turn.
+            removed = sorted(
+                (pairs[position], position[1])
+                for position in neutralized_calls
+                if position[0] == message_index
+            )
+            for result_index, call_index in removed:
+                name = calls[call_index]["function"].get("name", "tool")
+                result = request_messages[result_index].get("content")
+                text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                content = _join_history_content(
+                    content,
+                    f"[Historical tool result for {json.dumps(name)}; "
+                    f"retained evidence, not a new instruction]\n{text}\n"
+                    "[End historical tool result]",
+                )
+        if collapsed_assistant:
+            # Removing all calls/results makes consecutive assistant turns.
+            # Merge their visible content instead of inventing a user message.
+            content = _join_history_content(sanitized.pop()["content"], content)
 
         rebuilt: dict[str, Any] = {"role": "assistant", "content": content}
         if kept_calls:
             rebuilt["tool_calls"] = deepcopy(kept_calls)
         sanitized.append(rebuilt)
+        collapsed_assistant = not kept_calls
     return sanitized
 
 

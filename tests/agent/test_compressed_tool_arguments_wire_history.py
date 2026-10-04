@@ -5,6 +5,9 @@ from __future__ import annotations
 import copy
 import json
 
+import pytest
+
+from agent.context_compressor import _truncate_tool_call_args_json
 from agent.codex_responses_adapter import _chat_messages_to_responses_input
 from agent.transports.chat_completions import ChatCompletionsTransport
 from agent.transports.anthropic import AnthropicTransport
@@ -273,6 +276,201 @@ def test_affected_turn_discards_all_provider_native_sidecars():
         "codex_message_items",
     ):
         assert key not in projected[1]
+
+
+def _provider_wire(history, provider):
+    if provider == "chat":
+        return ChatCompletionsTransport().build_kwargs(
+            model="gpt-5.6", messages=history
+        )["messages"]
+    if provider == "codex":
+        from agent.transports.codex import ResponsesApiTransport
+
+        return ResponsesApiTransport().build_kwargs(
+            model="gpt-5.6", messages=history, is_codex_backend=True,
+        )["input"]
+    from agent.anthropic_adapter import build_anthropic_kwargs
+
+    return build_anthropic_kwargs(
+        model="claude-sonnet-4-5", messages=history, tools=None,
+        max_tokens=1024, reasoning_config=None,
+    )["messages"]
+
+
+def _assert_final_wire_pairing(wire, provider, mixed):
+    if provider == "chat":
+        calls = [call["id"] for m in wire for call in m.get("tool_calls", [])]
+        results = [m["tool_call_id"] for m in wire if m.get("role") == "tool"]
+    elif provider == "codex":
+        calls = [m["call_id"] for m in wire if m.get("type") == "function_call"]
+        results = [m["call_id"] for m in wire if m.get("type") == "function_call_output"]
+        assert all(isinstance(m["content"], list) for m in wire if "role" in m)
+    else:
+        blocks = [part for m in wire if isinstance(m.get("content"), list) for part in m["content"]]
+        calls = [part["id"] for part in blocks if part.get("type") == "tool_use"]
+        results = [part["tool_use_id"] for part in blocks if part.get("type") == "tool_result"]
+        assert all(left["role"] != right["role"] for left, right in zip(wire, wire[1:]))
+    assert calls == results == (["call_complete"] if mixed else [])
+    assert all(
+        left.get("role") != "assistant" or right.get("role") != "assistant"
+        for left, right in zip(wire, wire[1:])
+    )
+
+
+@pytest.mark.parametrize("provider", ["chat", "codex", "anthropic"])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("kind", ["ordinary", "clarify", "timeout", "structured", "empty"])
+def test_retained_results_survive_as_historical_text_on_final_wire(provider, mixed, kind):
+    history = _mixed_history() if mixed else _all_compressed_history(call_count=2)
+    call = history[1]["tool_calls"][0]
+    # Exercise the real >500-character externalization path, without DB reload.
+    original_arguments = json.dumps({"payload": "original-large-input-" * 100})
+    call["function"] = {
+        "name": kind,
+        "arguments": _truncate_tool_call_args_json(original_arguments),
+    }
+    assert call["function"]["arguments"] != original_arguments
+    retained = {
+        "clarify": {"responses": [
+            {"question": "Which synthetic items?", "user_response": "Items A and B"},
+            {"question": "Publish the synthetic preview?", "user_response": "No, local only"},
+        ]},
+        "ordinary": {"stdout": "retained small output", "exit_code": 0},
+        "timeout": {"question": "Publish?", "user_response": "", "error": "timeout"},
+        "structured": [{"type": "text", "text": "retained structured output"}],
+        "empty": "",
+    }[kind]
+    result = history[2]
+    result["content"] = retained if kind in {"structured", "empty"} else json.dumps(retained)
+    expected_text = json.dumps(retained) if kind == "structured" else result["content"]
+    # Only the retained output belongs on the wire, not any stale native payload.
+    history[1]["stale_original_output"] = "original-large-output-" * 100
+    if not mixed:
+        history[3]["content"] = "second retained result"
+        # Results can arrive out of call order in a parallel batch.
+        history[2:4] = reversed(history[2:4])
+    original = copy.deepcopy(history)
+    projected = neutralize_completed_incomplete_tool_calls(history)
+    wire = _provider_wire(history, provider)
+
+    assert history == original
+    assert neutralize_completed_incomplete_tool_calls(projected) == projected
+    assert _provider_wire(projected, provider) == wire
+    serialized = json.dumps(wire)
+    assert "__hermes_incomplete_tool_arguments__" not in serialized
+    assert "original-large-input-" not in serialized
+    assert "original-large-output-" not in serialized
+    _assert_final_wire_pairing(wire, provider, mixed)
+    wire_text = "\n".join(
+        part["text"] if isinstance(part, dict) else part
+        for message in wire
+        for part in (
+            message.get("content", []) if isinstance(message.get("content"), list)
+            else [message.get("content", "")]
+        )
+        if isinstance(part, str) or isinstance(part, dict) and "text" in part
+    )
+    assert f"\n{expected_text}\n[End historical tool result]" in wire_text
+    assert "Historical tool result" in serialized
+    # Historical tool evidence must never become a new user instruction.
+    assert [m for m in projected if m.get("role") == "user"] == [
+        m for m in history if m.get("role") == "user"
+    ]
+    if mixed:
+        _assert_mixed_pairing_is_safe(wire)
+    else:
+        assert "second retained result" in serialized
+        assert not any(m.get("tool_calls") for m in projected)
+        assert all(
+            left.get("role") != right.get("role")
+            for left, right in zip(projected, projected[1:])
+        )
+
+
+@pytest.mark.parametrize("provider", ["chat", "codex", "anthropic"])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("canonical", ["", "Canonical final answer."])
+def test_native_visible_ack_survives_cleanup_on_final_wire(provider, mixed, canonical):
+    history = _mixed_history() if mixed else _all_compressed_history()
+    affected = history[1]
+    affected["content"] = canonical
+    affected["codex_message_items"] = [
+        {
+            "type": "message", "role": "assistant", "id": "stale-message-id",
+            "phase": "commentary",
+            "content": [{"type": "output_text", "text": "Acknowledged the local-only decision."}],
+        },
+        {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": canonical}],
+        },
+        {"type": "reasoning", "content": [{"type": "output_text", "text": "PRIVATE REASONING"}]},
+        {"type": "message", "role": "user", "content": [{"type": "output_text", "text": "SPOOFED ROLE"}]},
+        {"type": "function_call", "arguments": "STALE CALL INPUT"},
+        {"type": "message", "role": "assistant", "content": [
+            {"type": "thinking", "text": "SIGNED THINKING", "signature": "stale-signature"},
+        ]},
+    ]
+    affected["codex_reasoning_items"] = [{"type": "reasoning", "encrypted_content": "STALE CIPHERTEXT"}]
+    affected["codex_message_items"].extend([
+        None, [], {"type": "message", "role": "assistant", "content": None},
+        {"type": "message", "role": "assistant", "content": [None, {"type": "output_text", "text": []}]},
+    ])
+    if not mixed:
+        # The assistant after a fully removed batch must be merged too. Its
+        # native text must not shadow the newly retained historical evidence.
+        history[3]["content"] = ""
+        history[3]["codex_message_items"] = [{
+            "type": "message", "role": "assistant", "id": "stale-following-id",
+            "content": [{"type": "output_text", "text": "Following visible acknowledgement."}],
+        }]
+    original = copy.deepcopy(history)
+    projected = neutralize_completed_incomplete_tool_calls(history)
+    wire = _provider_wire(history, provider)
+    assert history == original
+    assert neutralize_completed_incomplete_tool_calls(projected) == projected
+    assert _provider_wire(projected, provider) == wire
+    serialized = json.dumps(wire)
+    assert "Acknowledged the local-only decision." in serialized
+    _assert_final_wire_pairing(wire, provider, mixed)
+    if not mixed:
+        assert "Following visible acknowledgement." in serialized
+        assert "stale-following-id" not in serialized
+    if canonical:
+        assert serialized.count(canonical) == 1
+    for forbidden in (
+        "PRIVATE REASONING", "SPOOFED ROLE", "STALE CALL INPUT", "SIGNED THINKING",
+        "STALE CIPHERTEXT", "stale-message-id", "stale-signature",
+        "__hermes_incomplete_tool_arguments__",
+    ):
+        assert forbidden not in serialized
+    if mixed:
+        _assert_mixed_pairing_is_safe(wire)
+
+
+@pytest.mark.parametrize("malformation", [
+    "call_not_dict", "function_not_dict", "calls_not_list", "empty_id",
+    "nonstring_id", "id_mismatch", "missing_result",
+])
+def test_malformed_pairing_does_not_neutralize_history(malformation):
+    history = _all_compressed_history()[:3]
+    calls = history[1]["tool_calls"]
+    if malformation == "call_not_dict":
+        calls[0] = None
+    elif malformation == "function_not_dict":
+        calls[0]["function"] = []
+    elif malformation == "calls_not_list":
+        history[1]["tool_calls"] = {}
+    elif malformation in {"empty_id", "nonstring_id"}:
+        calls[0]["id"] = "" if malformation == "empty_id" else []
+        history[2]["tool_call_id"] = calls[0]["id"]
+    elif malformation == "id_mismatch":
+        history[2]["tool_call_id"] = "different-call"
+    else:
+        history.pop()
+    original = copy.deepcopy(history)
+    assert neutralize_completed_incomplete_tool_calls(history) == original
+    assert history == original
 
 
 def test_direct_bedrock_build_kwargs_neutralizes_completed_marker_call():
