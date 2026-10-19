@@ -692,13 +692,16 @@ def _memoized_search(provider, query: str, limit: int) -> dict:
         )
         if fallback is not None:
             return fallback, True
-        if _rescue_eligible(provider):
-            if fallback_error:
-                original_error += (
-                    f"; configured fallback '{_get_fallback_backend('search')}' also failed "
-                    f"({fallback_error[:200]})"
-                )
-            return _rescue_search(provider.name, original_error, query, fetch_limit), True
+        if fallback_error:
+            original_error += (
+                f"; configured fallback '{_get_fallback_backend('search')}' also failed "
+                f"({fallback_error[:200]})"
+            )
+        # Explicit secondary policy wins, then retain upstream's entitlement-
+        # guarded managed fallback before optional keyless rescue. All are one-shot.
+        served = _served_after_failure(original_error, fetch_limit)
+        if served is not None:
+            return served, True
         if primary_exception is not None:
             raise primary_exception
 

@@ -199,6 +199,12 @@ class TestFirecrawlClientConfig:
         from plugins.web.firecrawl import provider as firecrawl_provider
 
         captured = {}
+        # HTTP is mocked here; pin only its DNS seam, retaining real SSRF checks.
+        from tools import url_safety
+        import socket
+        monkeypatch.setattr(url_safety, "_getaddrinfo", lambda host: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+        ])
 
         class _Response:
             def raise_for_status(self):

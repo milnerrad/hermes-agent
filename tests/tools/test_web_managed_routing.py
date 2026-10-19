@@ -119,6 +119,44 @@ def test_only_managed_search_may_use_billed_fallback(
             assert headers.get("X-Pplx-Integration") == (None if managed else "hermes-agent")
 
 
+@pytest.mark.parametrize("secondary_succeeds", [False, True])
+def test_managed_failure_honors_explicit_secondary_before_billed_fallback(
+    monkeypatch, tmp_path, local_gateway, secondary_succeeds,
+):
+    """Real config/provider dispatch: explicit secondary wins; failure retains billed rescue."""
+    from hermes_cli.config import atomic_config_write
+    from tools import web_tools
+    from plugins.web.tavily.provider import TavilyWebSearchProvider
+    from tests.tools.conftest import register_all_web_providers
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TAVILY_API_KEY", "test-secondary-key")
+    monkeypatch.delenv("PERPLEXITY_API_KEY", raising=False)
+    atomic_config_write(tmp_path / "config.yaml", {"web": {
+        "backend": "nous", "search_fallback_backend": "tavily",
+        "keyless_rescue": False, "cache_enabled": True,
+    }})
+    secondary_calls = []
+
+    def secondary_search(self, query, limit):
+        secondary_calls.append(len(local_gateway))
+        if not secondary_succeeds:
+            return {"success": False, "error": "secondary outage"}
+        return {"success": True, "data": {"web": [{
+            "title": "secondary", "url": "https://example.test/secondary",
+        }]}}
+
+    monkeypatch.setattr(TavilyWebSearchProvider, "search", secondary_search)
+    register_all_web_providers()
+    paths = ["/perplexity/search"] + ([] if secondary_succeeds else ["/v2/search"])
+    for attempt in (1, 2):
+        result = json.loads(web_tools.web_search_tool("explicit secondary", limit=3))
+        assert result["success"] is True
+        assert [path for path, _, _ in local_gateway] == paths * attempt
+        assert secondary_calls == [1 + i * len(paths) for i in range(attempt)]
+        assert result["data"]["fallback_from"] == ("perplexity" if secondary_succeeds else "managed_primary")
+
+
 def test_managed_search_without_identity_names_the_gateway(monkeypatch, tmp_path, local_gateway):
     from hermes_cli.config import atomic_config_write
     from tools import managed_tool_gateway, web_tools
