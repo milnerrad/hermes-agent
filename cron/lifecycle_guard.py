@@ -1601,7 +1601,10 @@ def _contains_unsafe_gateway_action(
                     nested_command = command_string.group("command") if command_string else ""
                 if nested_command and recurse(nested_command, cwd, nested_executed=True):
                     return True
-            if recurse(body, cwd, explicit=True, nested_executed=False):
+            # A lenient source visit may tolerate an incomplete scan. Keep its
+            # visited paths local so a later executed reference is scanned with
+            # fail-closed limits, while retaining ancestor cycle detection.
+            if recurse(body, cwd, nested_visited=visited.copy(), explicit=True, nested_executed=False):
                 return True
             continue
         if not delimiter_quoted:
