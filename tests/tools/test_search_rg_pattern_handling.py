@@ -14,6 +14,13 @@ from tools.environments.local import LocalEnvironment
 pytestmark = pytest.mark.skipif(shutil.which("rg") is None, reason="requires ripgrep")
 
 
+@pytest.fixture(autouse=True)
+def shell_transport(monkeypatch):
+    # These tests inspect/mock shell commands; native parity is covered by
+    # test_search_native_pcre2.py and unmodified test_search_native_rg.py.
+    monkeypatch.setenv("HERMES_NATIVE_FILE_READ", "0")
+
+
 def _ops(root):
     return ShellFileOperations(LocalEnvironment(cwd=str(root)), cwd=str(root))
 
@@ -36,6 +43,7 @@ def _rg(ops, pattern, root, **kwargs):
         kwargs.get("offset", 0),
         kwargs.get("output_mode", "content"),
         kwargs.get("context", 0),
+        rg_executable="rg",  # command-shape tests bypass executable discovery
     )
 
 
@@ -83,7 +91,7 @@ def test_rg_without_pcre2_is_probed_once_and_not_retried(corpus, monkeypatch):
 
     def no_pcre2(command, *args, **kwargs):
         commands.append(command)
-        if command == "rg --pcre2-version":
+        if " --pcre2-version" in command:
             return ExecuteResult(stdout="PCRE2 is not available", exit_code=2)
         return ExecuteResult(stdout=parser_error, exit_code=2)
 
@@ -94,7 +102,7 @@ def test_rg_without_pcre2_is_probed_once_and_not_retried(corpus, monkeypatch):
 
     assert first.error is not None
     assert second.error is not None
-    assert commands.count("rg --pcre2-version") == 1
+    assert sum(" --pcre2-version" in command for command in commands) == 1
     assert not any(" --pcre2 " in command for command in commands)
 
 
@@ -231,7 +239,7 @@ def test_pcre2_retry_reuses_original_shell_template_and_timeout(corpus, monkeypa
     result = _rg(ops, r"alpha (?=foo)", corpus)
 
     assert result.error is None
-    search_calls = [call for call in calls if call[0] != "rg --pcre2-version"]
+    search_calls = [call for call in calls if " --pcre2-version" not in call[0]]
     assert search_calls[1][0] == search_calls[0][0].replace("rg ", "rg --pcre2 ", 1)
     assert search_calls[0][1] == search_calls[1][1] == 60
 

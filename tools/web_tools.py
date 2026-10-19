@@ -23,7 +23,7 @@ from tools.url_safety import async_is_safe_url
 from tools.web_tools_rescue import _managed_search_fallback, _rescue_eligible, _rescue_search
 from tools.web_tools_truncate import _effective_char_limit, _trim_results, _truncate_results, convert_base64_images_to_links
 from tools.web_tools_extract import (
-    _NO_RESULT_ERROR, _no_provider_error, _resolve_extract_provider, _result_entry,
+    _NO_RESULT_ERROR, _call_extract, _no_provider_error, _resolve_extract_provider, _result_entry,
     _strict_selection_error, _validate_extract_urls,
 )
 
@@ -375,9 +375,15 @@ def _policy_blocked_result(result: object) -> bool:
 
 
 def _map_extract_rows_by_url(urls: list, indices: list[int], rows: object) -> dict[int, dict]:
-    """Map untrusted provider rows by exact URL, preserving duplicate occurrence identity."""
+    """Associate rows with requested URLs, never list positions or redirect targets.
+
+    Firecrawl/Keenable report the original request in metadata.sourceURL after a
+    redirect. Prefer that identity when it names a request, even if the target is
+    another requested URL; it must still have an eligible pending occurrence.
+    """
     if not isinstance(rows, list):
         return {}
+    requested = {url for url in urls if isinstance(url, str)}
     pending: dict[str, list[int]] = {}
     for index in indices:
         if index < len(urls) and isinstance(urls[index], str):
@@ -386,7 +392,10 @@ def _map_extract_rows_by_url(urls: list, indices: list[int], rows: object) -> di
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get("url"), str):
             continue
-        candidates = pending.get(row["url"])
+        metadata = row.get("metadata")
+        source = metadata.get("sourceURL") if isinstance(metadata, dict) else None
+        identity = source if isinstance(source, str) and source in requested else row["url"]
+        candidates = pending.get(identity)
         if candidates:
             mapped[candidates.pop(0)] = row
     return mapped
@@ -411,15 +420,6 @@ def _extract_failure_message(rows: object) -> str:
         (str(row["error"]) for row in candidates if isinstance(row, dict) and row.get("error")),
         "extract failed",
     )
-
-
-async def _call_extract(provider, urls: list[str], format: str | None):
-    import asyncio
-    import inspect
-
-    if inspect.iscoroutinefunction(provider.extract):
-        return await provider.extract(urls, format=format)
-    return await asyncio.to_thread(provider.extract, urls, format=format)
 
 
 async def _try_fallback_extract(
@@ -542,6 +542,10 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: str | None)
     primary_exception = None
     try:
         results = await _call_extract(provider, fetch_urls, format)
+    except TimeoutError as exc:
+        # Stable timeout semantics are per-URL failures, still eligible for the
+        # configured secondary and keyless rescue, never a blank tool error.
+        results = [_result_entry(url, str(exc)) for url in fetch_urls]
     except Exception as exc:  # noqa: BLE001 — fallback/rescue candidate
         primary_exception = exc
         results = [_result_entry(url, str(exc)) for url in fetch_urls]
@@ -563,7 +567,7 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: str | None)
             raise primary_exception
         return failures
 
-    # Cache only exact-URL primary successes; fallback/rescue responses are one-shot.
+    # Cache only request-associated primary successes; fallback/rescue are one-shot.
     mapped = _map_extract_rows_by_url(fetch_urls, list(range(len(fetch_urls))), rows)
     for index, row in mapped.items():
         content = row.get("raw_content", "") or row.get("content", "")

@@ -146,29 +146,38 @@ def _extract_timeout_seconds() -> float:
         return _DEFAULT_EXTRACT_TIMEOUT_S
 
 
+async def _call_extract(provider, urls: list[str], format: Optional[str]):
+    """Common bounded transport for primary and configured-secondary extraction.
+
+    Only provider invocation lives here: cache and fallback decisions belong to
+    the caller. A sync provider runs in a thread and cannot pin the event loop.
+    """
+    import inspect
+
+    timeout = _extract_timeout_seconds()
+    if inspect.iscoroutinefunction(provider.extract):
+        coro = provider.extract(urls, format=format)
+    else:
+        coro = asyncio.to_thread(provider.extract, urls, format=format)
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout) if timeout > 0 else await coro
+    except TimeoutError as exc:
+        message = f"Extract timed out after {timeout:g}s via {provider.name}"
+        logger.warning("%s for %d URL(s)", message, len(urls))
+        raise TimeoutError(message) from exc
+
+
 async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[str]) -> list[dict]:
     """Call ``provider.extract`` (async or sync-in-thread), with one-shot keyless rescue.
 
     Rescue fires on a raised exception — including a dispatch timeout — or when the WHOLE batch
     failed (backend outage, not per-page problems). Rescued batches are never cached.
     """
-    import inspect
     from tools.web_result_cache import extract_cache_put
-    timeout = _extract_timeout_seconds()
     try:
-        if inspect.iscoroutinefunction(provider.extract):
-            coro = provider.extract(fetch_urls, format=format)
-        else:  # sync extract() runs in a thread so network I/O never blocks the loop
-            coro = asyncio.to_thread(provider.extract, fetch_urls, format=format)
-        if timeout > 0:
-            results = await asyncio.wait_for(coro, timeout=timeout)
-        else:
-            results = await coro
-    except TimeoutError:  # hanging backend — bounded, never a stalled tool call
-        logger.warning("web_extract provider '%s' timed out after %.0fs for %d URL(s)",
-                       provider.name, timeout, len(fetch_urls))
-        failed = [_result_entry(u, f"Extract timed out after {timeout:.0f}s via {provider.name}")
-                  for u in fetch_urls]
+        results = await _call_extract(provider, fetch_urls, format)
+    except TimeoutError as exc:  # hanging backend — bounded, never a stalled tool call
+        failed = [_result_entry(u, str(exc)) for u in fetch_urls]
         if not _rescue_eligible(provider):
             return failed
         return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed)

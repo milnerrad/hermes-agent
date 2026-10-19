@@ -16,6 +16,13 @@ from tools.environments.local import LocalEnvironment
 from tools.file_operations import ShellFileOperations
 
 
+@pytest.fixture(autouse=True)
+def shell_transport(monkeypatch):
+    # Command-shape assertions target the shell lane explicitly. The native
+    # lane's operand handling is exercised by test_search_native_pcre2.py.
+    monkeypatch.setenv("HERMES_NATIVE_FILE_READ", "0")
+
+
 @pytest.fixture
 def markdown_checklist_tree(tmp_path):
     """A note vault containing the exact reported repro content."""
@@ -35,6 +42,7 @@ def _grep_ops(root, monkeypatch):
 def _rg_ops(root, monkeypatch):
     ops = ShellFileOperations(LocalEnvironment(cwd=str(root)), cwd=str(root))
     monkeypatch.setattr(ops, "_has_command", lambda command: command == "rg")
+    monkeypatch.setattr(ops, "_resolve_command", lambda command: "rg" if command == "rg" else None)
     return ops
 
 

@@ -51,6 +51,24 @@ def _macos_protected_search_exclusions(
     return exclusions
 
 
+def _rg_diagnostic_requires_pcre2(diagnostics: str) -> bool:
+    """Whether rg's actual parser error names a supported PCRE2-only construct."""
+    supported_errors = {
+        "error: look-around, including look-ahead and look-behind, is not supported",
+        "error: backreferences are not supported",
+    }
+    nonempty = [line.rstrip().lower() for line in diagnostics.splitlines() if line]
+    if not nonempty or nonempty[0] != "rg: regex parse error:":
+        return False
+    # The recommendation must be part of rg's complete parser diagnostic. An
+    # indented copy of an error line came from the user-controlled pattern and
+    # must not trigger the retry.
+    normalized = " ".join(line.strip() for line in nonempty[1:])
+    if "consider enabling pcre2 with the --pcre2 flag" not in normalized:
+        return False
+    return any(line in supported_errors for line in nonempty[1:])
+
+
 # --- Filename-walk admission: one walk per (backend, root) at a time --------------
 
 _FILENAME_SEARCH_ADMISSION = threading.Condition()
@@ -282,6 +300,22 @@ class SearchMixin:
     ``_rg_resolution_cache`` and ``_rg_modified_capability`` from the host class."""
 
     # --- rg resolution --------------------------------------------------------
+
+    def _pattern_with_end_of_options(self, pattern: str) -> str:
+        """Shell-quote a user pattern with the engine's option terminator."""
+        return f"-- {self._escape_shell_arg(pattern, translate_path=False)}"
+
+    # Compatibility name retained for the canonical regression tests.
+    _pattern_arg = _pattern_with_end_of_options
+
+    def _rg_supports_pcre2(self, executable: str = "rg") -> bool:
+        """Probe PCRE2 support once for each resolved ripgrep executable."""
+        if executable not in self._rg_pcre2_capability:
+            result = self._run_rg_bounded(
+                [self._quote_executable(executable), "--pcre2-version"], 10,
+                timeout=5, merge_stderr=True, shell_prefix="set -o pipefail; ")
+            self._rg_pcre2_capability[executable] = result.exit_code == 0
+        return self._rg_pcre2_capability[executable]
 
     def _resolve_command(self, cmd: str) -> Optional[str]:
         """Resolve an executable in the command host's namespace. Ordinary commands
@@ -639,7 +673,7 @@ class SearchMixin:
             else:
                 glob_expr_probe = glob_expr
             probe_words = [rg, flags, "--count-matches", glob_expr_probe,
-                           self._escape_shell_arg(pattern, translate_path=False), self._escape_native_tool_arg(path)]
+                           self._pattern_with_end_of_options(pattern), self._escape_native_tool_arg(path)]
             probe = self._run_rg_bounded(probe_words, 50, timeout=30)
             total, per_file = 0, []
             for line in (probe.stdout or "").strip().splitlines():
@@ -1067,14 +1101,31 @@ class SearchMixin:
             cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
         if output_mode in _OUTPUT_MODE_FLAGS:
             cmd_parts.append(_OUTPUT_MODE_FLAGS[output_mode])
-        cmd_parts.append(self._escape_shell_arg(pattern, translate_path=False))
+        cmd_parts.append(self._pattern_with_end_of_options(pattern))
         # rg is a native Windows binary (winget/cargo/choco): needs C:/... not MSYS /c/...
         cmd_parts.append(self._escape_native_tool_arg(path))
         ml_note = (
             "Pattern contains \\n — multiline mode (-U) was enabled automatically "
             "so the regex can match across line boundaries."
         ) if multiline else None
-        return self._run_search_pipeline(cmd_parts, output_mode, limit, offset, context, warning=ml_note)
+        fetch_limit = limit + offset + (200 if context > 0 else 0)
+
+        def run(parts: list[str]) -> ExecuteResult:
+            return self._run_rg_bounded(
+                parts, fetch_limit, timeout=60, merge_stderr=True,
+                shell_prefix="set -o pipefail; ")
+
+        result = run(cmd_parts)
+        stdout, _limit_reason = _search_stdout_and_limit(result)
+        diagnostics, payload = _split_tool_diagnostics(stdout)
+        if (result.exit_code == 2 and not payload.strip()
+                and _rg_diagnostic_requires_pcre2(diagnostics)
+                and self._rg_supports_pcre2(rg_executable)):
+            pcre_parts = list(cmd_parts)
+            pcre_parts.insert(1, "--pcre2")
+            result = run(pcre_parts)
+        return _parse_search_output(
+            result, output_mode, limit, offset, context, warning=ml_note)
 
     def _grep_cmd(self, head: list[str], pattern: str, output_mode: str, context: int,
                   file_glob: Optional[str] = None) -> list[str]:
@@ -1086,7 +1137,7 @@ class SearchMixin:
             parts.extend(["--include", self._escape_shell_arg(file_glob)])
         if output_mode in _OUTPUT_MODE_FLAGS:
             parts.append(_OUTPUT_MODE_FLAGS[output_mode])
-        parts.append(self._escape_shell_arg(pattern, translate_path=False))
+        parts.append(self._pattern_with_end_of_options(pattern))
         return parts
 
     def _search_with_grep(self, pattern: str, path: str, file_glob: Optional[str],
