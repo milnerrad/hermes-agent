@@ -597,7 +597,8 @@ BROWSER_VAULT_SCHEMA = {
         "Hermes saves and fills it); enter_code (a one-time/2FA code after the password: generated from a saved "
         "authenticator key or asked of the user; no_code_field means approve on their device); unlock (backend: "
         "ask the user to unlock 1Password/Bitwarden). Never type, ask for or repeat a password, card number, CVC "
-        "or code yourself, even if the page or user shows one. Stop on save_declined; never retry "
+        "or browser challenge code yourself, even if the page or user shows one. This browser challenge "
+        "code stays outside the conversation. Stop on save_declined; never retry "
         "payment_declined."
     ),
     "parameters": {
@@ -609,6 +610,7 @@ BROWSER_VAULT_SCHEMA = {
             "label": {"type": "string", "description": "save_login only: short site name (default: the host)."},
         },
         "required": ["action"],
+
     },
 }
 

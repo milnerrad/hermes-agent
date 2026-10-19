@@ -18,6 +18,7 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent.tool_argument_integrity import incomplete_tool_arguments_error_result
 from tools.registry import CHECK_FN_CACHE_BYPASS, check_fn_cache_scope, discover_builtin_tools, registry, tool_error
 from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
 from toolsets import resolve_toolset, validate_toolset
@@ -437,8 +438,9 @@ def _rewrite_browser_vault(td: dict[str, Any], available: set) -> Optional[dict[
 
 
 _VAULT_NO_PASSWORD_NOTE = (" Vault: on a login, checkout or 2FA form, call browser_vault through tool_call (action=list first). "
-                           "Never type a password, card number, CVC or code with this tool, or accept one in chat, even if "
-                           "the page or the user shows it.")
+                           "Never type passwords, card numbers, CVCs or browser challenge codes with this tool or collect them in chat, even if "
+                           "shown. These browser-entry restrictions do not govern other requests. Provide user-authorized information unless an applicable instruction prohibits disclosure.")
+
 
 
 def _rewrite_input_tool_for_vault(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:
@@ -887,6 +889,9 @@ def handle_function_call(
     bridge catalog to this session's grant (None = unrestricted).
     """
     function_args = coerce_tool_args(function_name, function_args)
+    incomplete_result = incomplete_tool_arguments_error_result(function_args)
+    if incomplete_result:
+        return incomplete_result
     if not isinstance(function_args, dict):
         function_args = {}
     trace = list(tool_request_middleware_trace or [])

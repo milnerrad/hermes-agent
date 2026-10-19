@@ -185,6 +185,16 @@ def spawn_background_process(
             result_data["hint"] = (existing + "\n\n" + _HOMEBREW_CI_POLLER_HINT if existing
                                    else _HOMEBREW_CI_POLLER_HINT)
 
+        from agent.delegation_context import is_delegated_child_context
+        if is_delegated_child_context() and (notify_on_complete or watch_patterns):
+            result_data["notify_on_complete"] = False
+            result_data["subagent_note"] = _SUBAGENT_NOTIFY_NOTE
+            if watch_patterns:
+                result_data["watch_patterns_ignored"] = (
+                    "Subagent background notifications are suppressed; wait, stop, or hand off the process."
+                )
+            notify_on_complete, watch_patterns = False, None
+
         notify_on_complete, watch_patterns = _apply_async_support(
             proc_session, result_data, notify_on_complete, watch_patterns)
         watch_patterns, conflict_note = _resolve_notification_flag_conflict(
@@ -200,11 +210,7 @@ def spawn_background_process(
                 proc_session.completion_output_chars = int(completion_output_chars)
             if proc_session.watcher_platform:
                 _register_completion_watcher(process_registry, proc_session, session_key)
-            from agent.delegation_context import is_delegated_child_context
-            if is_delegated_child_context():
-                result_data["notify_on_complete"] = False
-                result_data["subagent_note"] = _SUBAGENT_NOTIFY_NOTE
-            elif heartbeat_seconds:
+            if heartbeat_seconds:
                 # Heartbeats ride the same delivery path as the completion notice, so they are
                 # only armed where that notice can actually reach the agent.
                 result_data["heartbeat_seconds"] = process_registry.arm_heartbeat(proc_session, heartbeat_seconds)

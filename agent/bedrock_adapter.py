@@ -928,6 +928,9 @@ def convert_messages_to_converse(
     user blocks. Converse needs strict user/assistant alternation with a user turn first and last:
     same-role neighbours merge, placeholder user turns pad the ends. ``model`` selects the reasoning
     replay policy for turns before the in-flight tool loop (None replays every carrier verbatim)."""
+    from agent.tool_argument_integrity import neutralize_completed_incomplete_tool_calls
+
+    messages = neutralize_completed_incomplete_tool_calls(messages)
     policy = _converse_replay_policy(model)
     prior_filter, loop_filter = _REASONING_FILTERS[policy]
     # Tool results are role "tool" here, so the last role "user" message opens the in-flight tool loop.
@@ -936,6 +939,7 @@ def convert_messages_to_converse(
     converse_msgs: list[dict] = []
 
     def append_turn(role: str, blocks: list[dict]) -> None:
+
         if converse_msgs and converse_msgs[-1]["role"] == role:
             converse_msgs[-1]["content"].extend(blocks)
         else:
