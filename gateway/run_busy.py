@@ -131,6 +131,13 @@ class GatewayBusySessionMixin:
         # else: no adapter — leave the head in place so we don't silently drop it.
         return pending_event
 
+    def _requeue_event_at_front(self, session_key: str, event: MessageEvent, adapter: Any) -> None:
+        """Restore a drained FIFO head without losing or merging its staged successor."""
+        staged = adapter._pending_messages.pop(session_key, None)
+        if staged is not None:
+            self._session_state(session_key).conversation.queued_events.insert(0, staged)
+        adapter._pending_messages[session_key] = event
+
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
         depth = len(self._overflow_queue(session_key) or ())
