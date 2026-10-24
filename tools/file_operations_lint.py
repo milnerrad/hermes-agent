@@ -342,8 +342,12 @@ class LintMixin:
         try:
             from agent.lsp import deferred
             from agent.lsp.edit_check import inline_wait
-            abs_path = os.path.abspath(path)
-            owner = deferred.current_owner()
+        except Exception:
+            return "LSP diagnostics unavailable: the edit is NOT verified clean."
+        abs_path = os.path.abspath(path)
+        owner = deferred.current_owner()
+        carry = ()
+        try:
             # This session's undelivered verdict for the file: the new check takes it over (diffs
             # against its baseline) and hands it back in ``result.carry`` only if it gets no verdict.
             older = deferred.take(owner, abs_path)
@@ -351,28 +355,38 @@ class LintMixin:
             future = svc.start_edit_check(path, pre_text=pre_content, post_text=post_content, owner=owner,
                                           carry=carry)
         except Exception:
-            return ""
+            if carry:
+                deferred.restore(owner, abs_path, carry)
+            return "LSP diagnostics unavailable: the edit is NOT verified clean."
         if future is None:
             deferred.restore(owner, abs_path, carry)
-            return ""
+            return deferred.unavailable(path)
         import concurrent.futures
         try:
             result = future.result(timeout=inline_wait(started))
         except concurrent.futures.TimeoutError:
             if owner:
-                token = deferred.track_pending(owner)
-                future.add_done_callback(lambda f: _post_deferred(owner, abs_path, f, carry, token))
-            return ""
+                token = deferred.track_pending(owner, abs_path, timeout=getattr(future, "lsp_settlement_timeout", 5.0))
+                future.add_done_callback(lambda f: _post_deferred(owner, abs_path, f, carry, token, pre_content))
+                return ""
+            # Without a session there is no later delivery channel: disclose uncertainty inline.
+            return deferred.unavailable(path)
         except Exception:  # LSP never breaks a write
             logger.debug("LSP edit check failed for %s", path, exc_info=True)
             deferred.restore(owner, abs_path, carry)
-            return ""
+            return deferred.unavailable(path)
+        if result is None:
+            deferred.restore(owner, abs_path, carry)
+            return deferred.unavailable(path)
         if result.superseded:
             return ""
         if result.diagnostics is None:
             deferred.restore(owner, abs_path, result.carry)
-            return ""
-        return _format_lsp_block(path, result.diagnostics, "LSP diagnostics introduced by this edit:\n")
+            return deferred.unavailable(path)
+        text = _format_lsp_block(path, result.diagnostics, "LSP diagnostics introduced by this edit:\n")
+        if getattr(result, "incomplete", False):
+            text += "\n" + deferred.unavailable(path)
+        return text
 
 
 def _format_lsp_block(path: str, diagnostics, header: str) -> str:
@@ -384,39 +398,45 @@ def _format_lsp_block(path: str, diagnostics, header: str) -> str:
         return truncate(header + block) if block else ""
     except Exception:  # LSP never breaks a write
         logger.debug("formatting LSP diagnostics for %s failed", path, exc_info=True)
-        return ""
+        return f"LSP diagnostics unavailable for {path}: formatting failed. The edit is NOT verified clean."
 
 
-def _post_deferred(owner: str, abs_path: str, future, carry, token) -> None:
+def _post_deferred(owner: str, abs_path: str, future, carry, token, baseline_text=None) -> None:
     """Done-callback (LSP loop thread): queue a late verdict for the session that made the edit, then
     release a turn end waiting on it (``agent.lsp.deferred.settle_for_agent``)."""
     from agent.lsp import deferred
     try:
-        _queue_late_verdict(owner, abs_path, future, carry)
+        _queue_late_verdict(owner, abs_path, future, carry, baseline_text)
     finally:
         deferred.settled(owner, token)
 
 
-def _queue_late_verdict(owner: str, abs_path: str, future, carry) -> None:
+def _queue_late_verdict(owner: str, abs_path: str, future, carry, baseline_text=None) -> None:
     """A superseded check posts nothing: the newer check owns its verdict AND the notes it carried.
     No verdict hands back only what the check still holds (``result.carry``), never the caller's copy."""
     from agent.lsp import deferred
+    baseline_text = carry[0].baseline_text if carry else baseline_text
     try:
         result = None if future.cancelled() else future.result()
     except Exception:  # a failed check reports nothing; the older note goes back
         logger.debug("deferred LSP edit check failed for %s", abs_path, exc_info=True)
         deferred.restore(owner, abs_path, carry)
+        deferred.post(owner, abs_path, deferred.unavailable(abs_path), baseline_text)
         return
     if result is None:
         deferred.restore(owner, abs_path, carry)
+        deferred.post(owner, abs_path, deferred.unavailable(abs_path), baseline_text)
         return
     if result.superseded:
         return
     if result.diagnostics is None:
         deferred.restore(owner, abs_path, result.carry)
+        deferred.post(owner, abs_path, deferred.unavailable(abs_path), result.baseline_text)
         return
     text = _format_lsp_block(abs_path, result.diagnostics, (
         f"LSP diagnostics introduced by your earlier edit of {abs_path} "
         "(the language server answered after that tool result returned):\n"))
+    if getattr(result, "incomplete", False):
+        text += "\n" + deferred.unavailable(abs_path)
     if text:
         deferred.post(owner, abs_path, text, result.baseline_text)

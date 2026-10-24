@@ -30,7 +30,15 @@ from tools.file_operations_common import (
     _UTF8_BOM, _detect_line_ending, _has_bom, _normalize_line_endings, _strip_bom,
     _strip_terminal_fence_leaks, normalize_read_pagination, normalize_search_pagination)
 from tools.file_operations_lint import LINTERS_INPROC, LintMixin, _FAIL_CLOSED_INPROC_EXTS
-from tools.file_operations_search import SearchMixin
+from tools.file_operations_search import (
+    SearchMixin,
+    _OUTPUT_MODE_FLAGS,
+    _parse_search_output,
+    _pattern_has_regex_newline,
+    _rg_diagnostic_requires_pcre2,
+    _search_stdout_and_limit,
+    _split_tool_diagnostics,
+)
 from tools import file_operations_native as _native_io
 
 logger = logging.getLogger(__name__)
@@ -225,6 +233,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         self._command_cache: dict[str, bool] = {}
         self._rg_resolution_cache: dict[str, str] = {}
         self._rg_modified_capability: dict[str, Optional[str]] = {}
+        self._rg_pcre2_capability: dict[str, bool] = {}
 
     def _exec(self, command: str, cwd: str | None = None, timeout: int | None = None,
               stdin_data: str | None = None) -> ExecuteResult:
@@ -578,11 +587,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         gives umask-default perms instead of mktemp's 0600 — not ``$(umask)``
         arithmetic (zsh parses leading-zero constants as decimal), quoted so zsh
         doesn't =word-expand. ``trap ... EXIT`` removes the temp on every failure.
-        The local POSIX backend does the same in-process (``tools.file_operations_native``).
         """
-        if self._native_read_enabled():
-            error = _native_io.atomic_write(self._native_path(path), content.encode("utf-8", "surrogateescape"))
-            return ExecuteResult(stdout=error or "", exit_code=1 if error else 0)
         q_path = self._escape_shell_arg(path)
         q_parent = self._escape_shell_arg(os.path.dirname(path) or ".")
         tmpl = self._escape_shell_arg(".hermes-tmp.XXXXXX")
@@ -1424,16 +1429,6 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         else:
             body_mode = None
 
-        native = _native_io.probe(self._native_path(path), body_mode == "cat") if self._native_read_enabled() else None
-        if native is not None:
-            has_bom, raw = native
-            # Decoded as the shell transport decodes (errors="replace"): same pre_content either way.
-            body = raw.decode("utf-8", "replace") if raw else ""
-            if body_mode == "cat" and body:
-                pre_content = body
-            sample = pre_content or (body if body_mode == "sample" else "")
-            return has_bom, pre_content, _detect_line_ending(sample) if sample else None
-
         sentinel = _new_sentinel(_WRITE_SENTINEL_PREFIX)
         probe = self._exec(self._write_probe_cmd(path, sentinel, body_mode))
         output = probe.stdout or ""
@@ -1497,11 +1492,9 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         The explicit flag saves the model a confirming re-read; a mismatch is a hard
         error. ``verified`` is None when the hash could not be taken."""
         try:
-            disk_sha = _native_io.sha256_of(self._native_path(path)) if self._native_read_enabled() else None
-            hash_result = None if disk_sha else self._exec(f"sha256sum {self._escape_shell_arg(path)} 2>/dev/null")
-            if hash_result is not None and hash_result.exit_code == 0 and hash_result.stdout.strip():
+            hash_result = self._exec(f"sha256sum {self._escape_shell_arg(path)} 2>/dev/null")
+            if hash_result.exit_code == 0 and hash_result.stdout.strip():
                 disk_sha = hash_result.stdout.strip().split()[0]
-            if disk_sha:
                 if disk_sha != hashlib.sha256(content_bytes).hexdigest():
                     return False, WriteResult(error=(
                         f"Post-write verification failed for {path}: on-disk "

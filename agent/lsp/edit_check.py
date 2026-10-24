@@ -58,6 +58,7 @@ class CheckResult:
     # Undelivered older notes this check took over and did not settle (no verdict): the caller queues
     # them again.  Empty whenever there is a verdict (it was diffed against the oldest baseline).
     carry: tuple = ()
+    incomplete: bool = False  # a previous verdict was retained after this check failed
 
 
 @dataclass
@@ -121,8 +122,12 @@ def start(svc: LSPService, path: str, *, pre_text: Optional[str], post_text: Opt
         checks.newest[abs_path] = post_text
     else:
         checks.newest.pop(abs_path, None)
-    return safe_schedule_threadsafe(
+    settlement_timeout = max(5.0, min(15.0, svc._wait_budget(abs_path)))
+    future = safe_schedule_threadsafe(
         _serialized(svc, abs_path, pre_text, post_text, owner, tuple(carry)), loop)
+    if future is not None:
+        setattr(future, "lsp_settlement_timeout", settlement_timeout)
+    return future
 
 
 async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str], post_text: Optional[str],
@@ -160,20 +165,25 @@ async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str], p
             # baseline and owns our carried notes, so our own round trip would only delay it.
             return CheckResult(prev_result.diagnostics if prev_result else None,
                                prev_result.baseline_text if prev_result else baseline_text, True)
+        epoch = svc._edit_diagnostics_epoch(abs_path)
+        if svc._skip_degraded_diagnostics(abs_path):
+            return CheckResult(None, baseline_text, carry=carry)
         budget = svc._wait_budget(abs_path)
         try:
             diags = await asyncio.wait_for(_check(svc, abs_path, baseline_text, post_text, budget),
                                            timeout=2 * budget + _SPAWN_CEILING)
         except asyncio.CancelledError:
+            svc._finish_edit_diagnostics(epoch, False)
             raise
         except Exception as e:  # timeout / dead server: same treatment as the old blocking path
             logger.debug("LSP edit check failed for %s", abs_path, exc_info=True)
             await svc._mark_broken_for_file_async(abs_path, e)
             diags = None
+        svc._finish_edit_diagnostics(epoch, diags is not None)
         if diags is not None:
             result = CheckResult(diags, baseline_text)
         elif prev_result is not None:
-            result = CheckResult(prev_result.diagnostics, prev_result.baseline_text)
+            result = CheckResult(prev_result.diagnostics, prev_result.baseline_text, incomplete=True)
         else:
             result = CheckResult(None, baseline_text, carry=carry)
         result.superseded = me.superseded

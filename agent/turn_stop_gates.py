@@ -99,9 +99,6 @@ def _late_lsp_verdicts(agent) -> Optional[str]:
     """Language-server verdicts on this turn's edits that no tool result carried yet (the edit was the
     last tool call; a one-shot run has no next turn to carry them): waits briefly for checks still
     running (``agent.lsp.deferred.settle_for_agent``) and returns them as a message for the model."""
-    issued = getattr(agent, "_lsp_turn_end_notes", 0)
-    if not isinstance(issued, int) or issued >= _MAX_LSP_TURN_END_NOTES:
-        return None
     try:
         from agent.lsp.deferred import settle_for_agent
 
@@ -112,7 +109,7 @@ def _late_lsp_verdicts(agent) -> Optional[str]:
     if not notes:
         return None
     body = "\n\n".join(text for _path, text in notes)
-    return ("[System note: the language server reported problems in files you edited this turn, after "
+    return ("[System note: the language server reported diagnostics or uncertainty for files you edited this turn, after "
             "those tool results had returned. Fix them if they are real, then give your final answer.]\n\n"
             + body)
 
@@ -156,8 +153,17 @@ def apply_stop_gates(
         )
 
     _lsp_note = _late_lsp_verdicts(agent)
+    issued = getattr(agent, "_lsp_turn_end_notes", 0)
+    if not isinstance(issued, int):
+        issued = _MAX_LSP_TURN_END_NOTES  # malformed state cannot buy unlimited continuations
+    if _lsp_note and issued >= _MAX_LSP_TURN_END_NOTES:
+        # Exhaustion bounds model continuations, not disclosure or the independent stop gates.
+        warning = "LSP verification remains unresolved; NOT verified clean (continuation limit reached):\n" + _lsp_note
+        final_response = str(final_response or "") + "\n\n" + warning
+        final_msg["content"] = final_response
+        _lsp_note = None
     if _lsp_note:
-        agent._lsp_turn_end_notes = getattr(agent, "_lsp_turn_end_notes", 0) + 1  # int: checked above
+        agent._lsp_turn_end_notes = issued + 1
         final_msg["finish_reason"] = "verification_required"
         _append_interim_answer(
             agent, final_msg, messages, conversation_history, "late-LSP interim flush failed"

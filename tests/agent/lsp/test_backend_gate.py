@@ -67,5 +67,5 @@ def test_edit_check_started_for_local_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr("agent.lsp.get_service", lambda: FakeService())
 
-    assert fops._maybe_lsp_diagnostics(str(tmp_path / "x.py"), pre_content="x = 1\n", post_content="x = 2\n") == ""
+    assert "NOT verified clean" in fops._maybe_lsp_diagnostics(str(tmp_path / "x.py"), pre_content="x = 1\n", post_content="x = 2\n")
     assert started == [(str(tmp_path / "x.py"), "x = 1\n", "x = 2\n")]

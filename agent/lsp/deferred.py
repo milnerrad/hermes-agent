@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import threading
+import time
 from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -28,7 +29,7 @@ _MAX_OWNERS = 64  # sessions that never drain (a one-shot caller) must not grow 
 _MAX_PER_OWNER = 32
 _LOCK = threading.Lock()
 _SETTLED = threading.Condition(_LOCK)
-# A turn-end wait longer than this hands the verdict to the next user turn instead.
+# Warm final settlement retains its five-second ceiling; cold checks carry a bounded allowance.
 TURN_END_WAIT = 5.0
 
 
@@ -41,7 +42,12 @@ class _Note:
 # owner -> {abs path -> note}, oldest owner first
 _QUEUED: OrderedDict[str, OrderedDict[str, _Note]] = OrderedDict()
 # owner -> tokens of its checks still running (their verdict lands in _QUEUED or nowhere)
-_PENDING: dict[str, set[object]] = {}
+_PENDING: dict[str, dict[object, tuple[str, float]]] = {}
+_REPORTED: set[object] = set()
+
+
+def unavailable(path: str) -> str:
+    return f"LSP diagnostics unavailable for {path}: check failed, was skipped, or exceeded its bounded wait. The edit is NOT verified clean."
 
 
 @contextlib.contextmanager
@@ -103,12 +109,12 @@ def pop_notes(*owners: Optional[str]) -> list[tuple[str, str]]:
     return out
 
 
-def track_pending(owner: str) -> object:
+def track_pending(owner: str, path: str = "edited file", *, timeout: float = TURN_END_WAIT) -> object:
     """Record a check of ``owner``'s still running; pass the token to :func:`settled` once its verdict
     has been posted (or dropped)."""
     token = object()
     with _LOCK:
-        _PENDING.setdefault(owner, set()).add(token)
+        _PENDING.setdefault(owner, {})[token] = (path, time.monotonic() + min(15.0, max(0.0, timeout)))
     return token
 
 
@@ -116,7 +122,8 @@ def settled(owner: str, token: object) -> None:
     with _SETTLED:
         tokens = _PENDING.get(owner)
         if tokens is not None:
-            tokens.discard(token)
+            tokens.pop(token, None)
+            _REPORTED.discard(token)
             if not tokens:
                 del _PENDING[owner]
         _SETTLED.notify_all()
@@ -127,15 +134,29 @@ def _owners(agent: Any) -> tuple[Optional[str], ...]:
     return tuple(o if isinstance(o, str) else None for o in owners)
 
 
-def settle_for_agent(agent: Any, timeout: float = TURN_END_WAIT) -> list[tuple[str, str]]:
-    """Turn end: wait up to ``timeout`` for ``agent``'s running checks, then pop every undelivered
-    ``(path, text)`` verdict.  Returns at once when nothing is running."""
+def settle_for_agent(agent: Any, timeout: Optional[float] = None) -> list[tuple[str, str]]:
+    """Wait to the latest owned check deadline (at most 15s), or an explicit caller timeout.
+    Drain completed notes atomically; disclose unfinished checks once without forgetting their owner.
+    No running checks means no wait. A future real verdict still belongs to this session."""
     owners = [o for o in dict.fromkeys(_owners(agent)) if o]
     if not owners:
         return []
     with _SETTLED:
-        _SETTLED.wait_for(lambda: not any(_PENDING.get(o) for o in owners), timeout=timeout)
-    return pop_notes(*owners)
+        def remaining():
+            return [(token, entry) for o in owners for token, entry in _PENDING.get(o, {}).items()
+                    if token not in _REPORTED]
+        deadline = max((entry[1] for _, entry in remaining()), default=time.monotonic())
+        wait = max(0.0, deadline - time.monotonic()) if timeout is None else max(0.0, timeout)
+        _SETTLED.wait_for(lambda: not remaining(), timeout=min(15.0, wait))
+        # Retain ownership for a later real verdict, but never wait/nudge repeatedly for this token.
+        unknown = [(path, unavailable(path)) for token, (path, _) in remaining()]
+        _REPORTED.update(token for token, _ in remaining())
+        out = []
+        for owner in owners:
+            notes = _QUEUED.pop(owner, None)
+            if notes:
+                out.extend((path, note.text) for path, note in notes.items())
+        return out + unknown
 
 
 def forward_to_agent(agent: Any) -> None:
