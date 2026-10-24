@@ -421,17 +421,20 @@ def _queue_late_verdict(owner: str, abs_path: str, future, carry, baseline_text=
     except Exception:  # a failed check reports nothing; the older note goes back
         logger.debug("deferred LSP edit check failed for %s", abs_path, exc_info=True)
         deferred.restore(owner, abs_path, carry)
-        deferred.post(owner, abs_path, deferred.unavailable(abs_path), baseline_text)
+        deferred.post(owner, abs_path, deferred.unavailable(abs_path), baseline_text,
+                      baseline_authoritative=False)
         return
     if result is None:
         deferred.restore(owner, abs_path, carry)
-        deferred.post(owner, abs_path, deferred.unavailable(abs_path), baseline_text)
+        deferred.post(owner, abs_path, deferred.unavailable(abs_path), baseline_text,
+                      baseline_authoritative=False)
         return
     if result.superseded:
         return
     if result.diagnostics is None:
         deferred.restore(owner, abs_path, result.carry)
-        deferred.post(owner, abs_path, deferred.unavailable(abs_path), result.baseline_text)
+        deferred.post(owner, abs_path, deferred.unavailable(abs_path), result.baseline_text,
+                      baseline_authoritative=False)
         return
     text = _format_lsp_block(abs_path, result.diagnostics, (
         f"LSP diagnostics introduced by your earlier edit of {abs_path} "

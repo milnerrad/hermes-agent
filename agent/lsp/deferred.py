@@ -37,6 +37,7 @@ TURN_END_WAIT = 5.0
 class _Note:
     text: str
     baseline_text: Optional[str]  # pre-edit content the verdict was diffed against
+    baseline_authoritative: bool = True  # generic cancellation uncertainty is not a verdict
 
 
 # owner -> {abs path -> note}, oldest owner first
@@ -64,15 +65,23 @@ def current_owner() -> Optional[str]:
     return _OWNER.get()
 
 
-def post(owner: str, path: str, text: str, baseline_text: Optional[str]) -> None:
+def post(owner: str, path: str, text: str, baseline_text: Optional[str], *,
+         baseline_authoritative: bool = True) -> None:
     """Queue ``text`` (a formatted diagnostics block) for ``owner``.  A note still queued for ``path``
     (an older check finished while a newer one was starting) is kept in front, with its baseline."""
     with _LOCK:
         notes = _QUEUED.pop(owner, None) or OrderedDict()
         older = notes.pop(path, None)
         if older is not None and older.text != text:
-            text, baseline_text = f"{older.text}\n\n{text}", older.baseline_text
-        notes[path] = _Note(text, baseline_text)
+            text = f"{older.text}\n\n{text}"
+        if older is not None:
+            # A cancelled replacement's generic note can arrive before its actual predecessor.
+            # Retain the oldest REAL verdict's immutable baseline, not the replacement's pre-edit
+            # error snapshot; otherwise a following unverified edit can call that error pre-existing.
+            if older.baseline_authoritative or not baseline_authoritative:
+                baseline_text = older.baseline_text
+            baseline_authoritative = older.baseline_authoritative or baseline_authoritative
+        notes[path] = _Note(text, baseline_text, baseline_authoritative)
         while len(notes) > _MAX_PER_OWNER:
             notes.popitem(last=False)
         _QUEUED[owner] = notes
@@ -95,7 +104,8 @@ def restore(owner: Optional[str], path: str, notes) -> None:
     """Queue ``notes`` (oldest first) withdrawn by :func:`take` again."""
     if owner:
         for note in notes:
-            post(owner, path, note.text, note.baseline_text)
+            post(owner, path, note.text, note.baseline_text,
+                 baseline_authoritative=note.baseline_authoritative)
 
 
 def pop_notes(*owners: Optional[str]) -> list[tuple[str, str]]:
