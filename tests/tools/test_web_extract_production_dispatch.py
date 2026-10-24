@@ -14,6 +14,58 @@ from tools import web_tools_extract as wte
 URL = 'https://example.com/start'
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('secondary_configured', [False, True])
+async def test_slow_keyless_rescue_is_off_loop_and_bounded(dispatch, monkeypatch, secondary_configured):
+    import time
+    release = threading.Event()
+    secondary = SimpleNamespace(name='secondary', extract=AsyncMock(return_value=[
+        {'url': URL, 'error': 'secondary outage'},
+    ]))
+    monkeypatch.setattr(wt, '_get_secondary_provider', lambda *args: secondary if secondary_configured else None)
+    monkeypatch.setattr(wte, '_rescue_eligible', lambda p: True)
+    def slow_rescue(provider_name, urls):
+        release.wait(.6)
+        return [{'url': URL, 'content': 'late rescue'}]
+    monkeypatch.setattr('plugins.web.keyless_mcp.extract_with_failover', slow_rescue)
+    primary = SimpleNamespace(name='primary', extract=AsyncMock(return_value=[
+        {'url': URL, 'error': 'primary outage'},
+    ]))
+    observed = []
+    async def observer():
+        await asyncio.sleep(.005)
+        observed.append(time.monotonic() - started)
+    started = time.monotonic()
+    observer_task = asyncio.create_task(observer())
+    try:
+        result = await dispatch.run(primary)
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        await observer_task
+    assert observed and observed[0] < .3, 'sync rescue must not pin the event loop'
+    assert elapsed < .3, 'positive web.extract_timeout must also bound keyless rescue'
+    assert 'timed out' in result['results'][0]['error'].lower()
+    assert result['results'][0]['url'] == URL
+    dispatch.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('timeout', [0, -1])
+async def test_keyless_rescue_respects_explicit_timeout_disable(dispatch, monkeypatch, timeout):
+    import time
+    dispatch.config['extract_timeout'] = timeout
+    monkeypatch.setattr(wte, '_rescue_eligible', lambda p: True)
+    def rescue(provider_name, urls):
+        time.sleep(.04)
+        return [{'url': URL, 'content': 'slow rescue retained'}]
+    monkeypatch.setattr('plugins.web.keyless_mcp.extract_with_failover', rescue)
+    primary = SimpleNamespace(name='primary', extract=AsyncMock(return_value=[{'url': URL, 'error': 'outage'}]))
+    result = await dispatch.run(primary)
+    assert result['results'][0]['content'] == 'slow rescue retained'
+    dispatch.put.assert_not_called()
+
+
 @pytest.fixture
 def dispatch(monkeypatch):
     config = {'extract_timeout': 0.02, 'keyless_fallback': False, 'keyless_rescue': False}
