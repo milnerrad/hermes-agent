@@ -27,7 +27,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Optional
 
 from agent.lsp import eventlog, sync_diagnostics
@@ -67,6 +67,7 @@ class _Inflight:
     baseline_text: Optional[str]
     carry: tuple
     superseded: bool = False
+    previous: Optional[_Inflight] = None  # same-owner chain survives a cancelled intermediate task
 
 
 class EditChecks:
@@ -130,6 +131,46 @@ def start(svc: LSPService, path: str, *, pre_text: Optional[str], post_text: Opt
     return future
 
 
+async def _inherited_verdict(previous: Optional[_Inflight]) -> Optional[CheckResult]:
+    """A cancelled replacement cannot sever a newer same-owner check's inherited verdict."""
+    while previous is not None:
+        if not previous.task.done():
+            await asyncio.wait({previous.task})
+        if not previous.task.cancelled() and previous.task.exception() is None:
+            result = previous.task.result()
+            if result.diagnostics is not None:
+                return result  # [] is a real correction, never resurrect an older error
+        previous = previous.previous
+    return None
+
+
+def _return_predecessor_ownership(checks: EditChecks, me: _Inflight, previous: Optional[_Inflight],
+                                  owner: Optional[str], abs_path: str) -> None:
+    """Cancel only this edit, not its owner's unfinished or already suppressed predecessor."""
+    if not owner or me.superseded:
+        return  # a live successor owns the chain and will walk through this cancelled task
+    while previous is not None:
+        if not previous.task.done():
+            previous.superseded = False
+            if checks.inflight.get((owner, abs_path)) is me:
+                checks.inflight[(owner, abs_path)] = previous
+            if checks.tail.get(abs_path) is me:
+                checks.tail[abs_path] = previous
+            return  # its original callback will deliver exactly once
+        if not previous.task.cancelled() and previous.task.exception() is None:
+            result = previous.task.result()
+            if result.diagnostics is not None:
+                # Its callback already suppressed this superseded result. Project a copy, never
+                # mutate the result another successor/callback can still observe.
+                if result.diagnostics:
+                    from tools.file_operations_lint import _queue_late_verdict
+                    future = concurrent.futures.Future()
+                    future.set_result(replace(result, superseded=False, incomplete=True))
+                    _queue_late_verdict(owner, abs_path, future, (), result.baseline_text)
+                return
+        previous = previous.previous
+
+
 async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str], post_text: Optional[str],
                       owner: Optional[str], carry: tuple) -> CheckResult:
     """Run after any unfinished check of the same file; take over the same session's unfinished check:
@@ -147,7 +188,7 @@ async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str], p
         prev = None
     current = asyncio.current_task()
     assert current is not None
-    me = _Inflight(current, baseline_text, carry)
+    me = _Inflight(current, baseline_text, carry, previous=prev)
     checks.tail[abs_path] = me
     if owner:
         checks.inflight[(owner, abs_path)] = me
@@ -156,10 +197,7 @@ async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str], p
         waits = {t.task for t in (prev, tail) if t is not None}
         if waits:
             await asyncio.wait(waits)
-        if prev is not None and not prev.task.cancelled() and prev.task.exception() is None:
-            prev_result = prev.task.result()
-            if prev_result.diagnostics is None:
-                prev_result = None
+        prev_result = await _inherited_verdict(prev)
         if me.superseded:
             # A newer edit by this session queued behind us: it checks the newest bytes against our
             # baseline and owns our carried notes, so our own round trip would only delay it.
@@ -167,6 +205,8 @@ async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str], p
                                prev_result.baseline_text if prev_result else baseline_text, True)
         epoch = svc._edit_diagnostics_epoch(abs_path)
         if svc._skip_degraded_diagnostics(abs_path):
+            if prev_result is not None:
+                return CheckResult(prev_result.diagnostics, prev_result.baseline_text, incomplete=True)
             return CheckResult(None, baseline_text, carry=carry)
         budget = svc._wait_budget(abs_path)
         try:
@@ -190,6 +230,9 @@ async def _serialized(svc: LSPService, abs_path: str, pre_text: Optional[str], p
         if me.superseded:
             result.carry = ()  # the newer check took them over
         return result
+    except asyncio.CancelledError:
+        _return_predecessor_ownership(checks, me, prev, owner, abs_path)
+        raise
     finally:
         if checks.tail.get(abs_path) is me:
             del checks.tail[abs_path]

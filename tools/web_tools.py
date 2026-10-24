@@ -9,6 +9,7 @@ caching, keyless rescue, and the truncate-and-store result pipeline.
 Debug: ``WEB_TOOLS_DEBUG=true`` writes ``logs/web_tools_debug_<UUID>.json``.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -535,6 +536,23 @@ def _merge_in_order(
     return [merged[i] for i in range(total)]
 
 
+async def _call_rescue_extract(provider_name: str, urls: list, results: list) -> list:
+    """Keep the synchronous one-shot rescue off-loop and inside the same positive cap."""
+    from tools.web_tools_extract import _extract_timeout_seconds
+
+    timeout = _extract_timeout_seconds()
+    work = asyncio.to_thread(_rescue_extract, provider_name, urls, results)
+    try:
+        return await asyncio.wait_for(work, timeout=timeout) if timeout > 0 else await work
+    except TimeoutError:
+        message = f"Extract timed out after {timeout:g}s via {provider_name} keyless rescue"
+        # Keep successes/policy refusals and request identity; only rescue-eligible failures change.
+        return [
+            {**row, "error": message} if row.get("error") and not _policy_blocked_result(row) else row
+            for row in _normalize_extract_batch(urls, results)
+        ]
+
+
 async def _dispatch_extract(provider, fetch_urls: list[str], format: str | None) -> list:
     """Primary -> configured secondary -> keyless rescue; cache primary successes only."""
     from tools.web_result_cache import extract_cache_put
@@ -559,10 +577,10 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: str | None)
         )
         if fallback is not None:
             if _extract_rescue_eligible(provider) and _fallback_extract_needs_rescue(fetch_urls, fallback):
-                return _rescue_extract(provider.name, fetch_urls, fallback)
+                return await _call_rescue_extract(provider.name, fetch_urls, fallback)
             return fallback
         if _extract_rescue_eligible(provider):
-            return _rescue_extract(provider.name, fetch_urls, failures)
+            return await _call_rescue_extract(provider.name, fetch_urls, failures)
         if primary_exception is not None:
             raise primary_exception
         return failures
