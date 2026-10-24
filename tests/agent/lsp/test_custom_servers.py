@@ -32,6 +32,33 @@ def test_custom_server_precedes_builtins_and_carries_language_id():
     assert spec is not None and spec.command == [sys.executable, _MOCK]
 
 
+def test_custom_server_diagnostics_timeout_enters_and_clears_cooldown(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".git").mkdir()
+    target = workspace / "doc.pnch"
+    target.write_text("hello\n", encoding="utf-8")
+    custom = custom_servers({
+        "panache": {"command": [sys.executable, _MOCK], "extensions": [".pnch"]},
+    })
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=0.1,
+        install_strategy="manual",
+        idle_timeout=0,
+        extra_servers=custom,
+    )
+    try:
+        svc._degrade_diagnostics(str(target))
+        assert next(iter(svc._diagnostics_degraded_until))[0] == "panache"
+        assert svc._skip_degraded_diagnostics(str(target)) is True
+        svc._clear_diagnostics_degraded(str(target))
+        assert svc._diagnostics_degraded_until == {}
+    finally:
+        svc.shutdown()
+
+
 @pytest.mark.timeout(60)
 def test_service_gets_diagnostics_from_config_declared_server(tmp_path, monkeypatch):
     """End to end from config.yaml: the only production path from ``lsp.servers`` to a running server."""

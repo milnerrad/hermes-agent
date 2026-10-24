@@ -60,11 +60,17 @@ def test_search_dispatch_maps_search_api_shape():
     }
 
 
-def test_extract_dispatch_snippets_per_url_and_missing_key():
+def test_extract_dispatch_snippets_per_url_and_missing_key(monkeypatch):
     """web_extract on backend=perplexity posts every URL to /sdk/content/snippets;
     a URL the backend failed carries ``error`` instead of content; no key → error, no HTTP."""
     import tools.web_tools as wt
+    from tools import url_safety
+    import socket
 
+    # Only DNS is deterministic; production SSRF parsing/IP rejection still runs.
+    monkeypatch.setattr(url_safety, "_getaddrinfo", lambda host: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+    ])
     register_all_web_providers()
     urls = ["https://tokio.rs/tokio/tutorial", "https://docs.rs/smol"]
     payload = {"results": [
