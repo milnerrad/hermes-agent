@@ -527,8 +527,13 @@ class ChatCompletionsTransport(ProviderTransport):
     def convert_messages(self, messages: list[dict[str, Any]], **kwargs) -> list[dict[str, Any]]:
         """Strip internal fields that strict chat-completions providers reject (HTTP 400/422).
 
-        Returns the input list unchanged when nothing needs sanitizing.
+        Completed non-replayable compressed tool calls are removed from a
+        request-only copy before ordinary OpenAI-wire field sanitization. Returns
+        the input list unchanged when neither projection nor sanitization is needed.
         """
+        from agent.tool_argument_integrity import neutralize_completed_incomplete_tool_calls
+
+        messages = neutralize_completed_incomplete_tool_calls(messages)
         profile = kwargs.get("provider_profile")
         provider = getattr(profile, "name", None) or kwargs.get("provider")
         strip_extra_content = not _model_consumes_thought_signature(kwargs.get("model"), kwargs.get("base_url"), provider)
@@ -541,6 +546,7 @@ class ChatCompletionsTransport(ProviderTransport):
         mistral_ids = _route_requires_mistral_tool_ids(provider, kwargs.get("model"), kwargs.get("base_url"))
         sanitized_pairs = [(m, _sanitize_message(m, strip_extra_content, strip_reasoning, native_type,
                                                  mistral_tool_ids=mistral_ids))
+
                            for m in messages]
         if all(s is None for _, s in sanitized_pairs):
             return messages

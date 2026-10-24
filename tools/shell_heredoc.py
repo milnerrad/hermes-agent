@@ -177,8 +177,17 @@ def _find_heredoc_close(
         cursor = after
 
 
-def strip_inert_heredoc_bodies(command: str) -> str:
-    """Mask heredoc bodies that are provably inert data (see module docstring)."""
+def strip_inert_heredoc_bodies(command: str, *, data_sinks_only: bool = False) -> str:
+    """Mask inert outer-shell bodies; semantic scanners can retain interpreter source.
+
+    ``data_sinks_only`` preserves Python/AppleScript bodies: inert to the outer shell
+    does not mean inert to the interpreter consuming that source (#95295).
+    """
+    consumer_re = (
+        re.compile(r"^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:env\s+)?"
+                   r"(?:[A-Za-z0-9_./-]+/)?cat(?=\s|$)", re.IGNORECASE)
+        if data_sinks_only else _INERT_HEREDOC_CONSUMER_RE
+    )
     # Runs on every terminal call: skip the state machine when no '<<' exists; stop past the last.
     if "<<" not in command:
         return command
@@ -219,7 +228,7 @@ def strip_inert_heredoc_bodies(command: str) -> str:
             if not any(
                 marker in masked_opener
                 for marker in ("$(", "`", "<(", ">(", "(", ")", "{", "}")
-            ) and _INERT_HEREDOC_CONSUMER_RE.search(masked_owner):
+            ) and consumer_re.search(masked_owner):
                 ranges.extend(body_ranges)
         command_start = body_cursor
     # Single-pass rebuild (ranges are sorted and non-overlapping), bodies -> their newlines only.
