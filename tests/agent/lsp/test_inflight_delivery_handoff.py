@@ -101,3 +101,22 @@ async def test_cancellation_handoff_retains_inflight_error_exactly_once(monkeypa
     clean = await edit_check._serialized(svc, PATH, 'error before correction', 'clean', owner, carry)
     assert clean.diagnostics == [] and not clean.incomplete
     assert notes(owner) == []
+
+
+@pytest.mark.parametrize('unknown_first', [True, False])
+def test_cancel_uncertainty_never_replaces_real_predecessor_baseline(unknown_first):
+    from concurrent.futures import Future
+    owner = 'baseline-order-' + str(unknown_first)
+    unknown = Future(); unknown.cancel()
+    real = Future()
+    real.set_result(edit_check.CheckResult(ERROR, 'oldest clean baseline', incomplete=True))
+    deliveries = [(unknown, 'intermediate error'), (real, 'oldest clean baseline')]
+    if not unknown_first:
+        deliveries.reverse()
+    for future, baseline in deliveries:
+        _queue_late_verdict(owner, PATH, future, (), baseline)
+    carried = deferred.take(owner, PATH)
+    assert carried is not None
+    assert carried.baseline_text == 'oldest clean baseline'
+    assert carried.text.count('retained predecessor sentinel') == 1
+    assert 'NOT verified clean' in carried.text
