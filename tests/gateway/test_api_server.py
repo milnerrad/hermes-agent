@@ -986,8 +986,9 @@ class TestSkillsEndpoint:
         ]
         with patch(
             "tools.skills_tool.find_all_skills",
+            autospec=True,
             return_value=list(fake_skills),
-        ):
+        ) as find_skills:
             app = _create_app(adapter)
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/v1/skills")
@@ -998,6 +999,59 @@ class TestSkillsEndpoint:
                 assert names == ["ascii-art", "github"]
                 for entry in data["data"]:
                     assert set(entry.keys()) >= {"name", "description", "category"}
+            find_skills.assert_called_once_with(skip_disabled=False)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("empty", [False, True], ids=["file-backed", "empty"])
+    async def test_skills_real_reader_authenticated_catalogue(
+        self, auth_adapter, tmp_path, monkeypatch, empty
+    ):
+        """The real reader must accept the route's kwargs and scan only synthetic files."""
+        from tools import skills_tool
+
+        home = tmp_path / "hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.chdir(tmp_path)
+        (home / "config.yaml").write_text("skills:\n  disabled: [disabled-skill]\n")
+        expected = []
+        if not empty:
+            # Deliberately create in reverse catalogue order, including a disabled entry.
+            for category, name in [
+                ("zeta", "zulu"), ("alpha", "bravo"),
+                ("alpha", "aardvark"), ("alpha", "disabled-skill"),
+            ]:
+                skill_dir = home / "skills" / category / name
+                skill_dir.mkdir(parents=True)
+                (skill_dir / "SKILL.md").write_text(
+                    f"---\nname: {name}\ndescription: Description for {name}.\n---\n\nBody.\n"
+                )
+                if name != "disabled-skill":
+                    expected.append({"name": name, "description": f"Description for {name}.",
+                                     "category": category})
+            expected.sort(key=lambda entry: (entry["category"], entry["name"]))
+
+        # Replace only the process cache, never the reader or its discovery/filter helpers.
+        monkeypatch.setattr(skills_tool, "_SKILLS_CACHE", {})
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            # Both missing and wrong credentials must reject before catalogue enumeration.
+            for headers in ({}, {"Authorization": "Bearer wrong-synthetic-key"}):
+                rejected = await cli.get("/v1/skills", headers=headers)
+                assert rejected.status == 401
+                assert "error" in await rejected.json()
+                assert skills_tool._SKILLS_CACHE == {}
+            response = await cli.get(
+                "/v1/skills", headers={"Authorization": "Bearer sk-secret"}
+            )
+            assert response.status == 200
+            assert response.content_type == "application/json"
+            assert await response.json() == {"object": "list", "data": expected}
+        # skip_disabled=False retains disabled filtering; the config-UI opt-out is distinct.
+        if not empty:
+            assert "disabled-skill" in {
+                entry["name"] for entry in skills_tool.find_all_skills(skip_disabled=True)
+            }
 
 
 class TestToolsetsEndpoint:
