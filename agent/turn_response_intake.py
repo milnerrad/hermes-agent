@@ -176,6 +176,20 @@ def normalize_model_response(
         ))
     agent._incomplete_scratchpad_retries = 0
 
+    # Codex normalizes a completed reasoning-only reply to synthetic "incomplete".
+    # On a no-tool machinery turn let the final-response ladder recover streamed text
+    # or close quietly BEFORE the Codex pre-nudge can schedule another paid call.
+    # Real incomplete/failed provider responses and turns that acted keep recovery.
+    if agent.api_mode == "codex_responses" and finish_reason == "incomplete":
+        from agent.turn_empty_response import _notification_turn_without_tool_round
+        if (
+            getattr(response, "status", None) == "completed"
+            and not assistant_message.tool_calls
+            and not agent._has_content_after_think_block(content or "")
+            and _notification_turn_without_tool_round(messages)
+        ):
+            finish_reason = "stop"
+
     if agent.api_mode == "codex_responses" and finish_reason == "incomplete":
         _codex_result = continue_codex_incomplete(
             agent, assistant_message, finish_reason, messages=messages,
