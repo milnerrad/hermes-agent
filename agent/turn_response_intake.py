@@ -179,11 +179,15 @@ def normalize_model_response(
     # Codex normalizes a completed reasoning-only reply to synthetic "incomplete".
     # On a no-tool machinery turn let the final-response ladder recover streamed text
     # or close quietly BEFORE the Codex pre-nudge can schedule another paid call.
-    # Real incomplete/failed provider responses and turns that acted keep recovery.
+    # Only the adapter's exclusive-cause provenance permits this bypass: leaked
+    # actions, unfinished children, or commentary can coexist with reasoning.
+    # Missing metadata (including legacy/fake normalizers) keeps recovery.
     if agent.api_mode == "codex_responses" and finish_reason == "incomplete":
         from agent.turn_empty_response import _notification_turn_without_tool_round
         if (
             getattr(response, "status", None) == "completed"
+            and (getattr(assistant_message, "provider_data", None) or {}).get("codex_incomplete_reason")
+            == "completed_reasoning_only"
             and not assistant_message.tool_calls
             and not agent._has_content_after_think_block(content or "")
             and _notification_turn_without_tool_round(messages)

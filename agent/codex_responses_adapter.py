@@ -1300,17 +1300,25 @@ def _normalize_codex_response(
     trusted_final = (
         response_status == "completed" and issuer_kind not in ("codex_backend", "xai_responses", "github_responses")
     )
+    non_reasoning_incomplete = (
+        leaked_tool_call_text
+        or scan.saw_streaming_or_item_incomplete
+        or ((scan.has_incomplete_items or scan.saw_commentary_phase) and not scan.saw_final_answer_phase)
+    )
     if tool_calls:
         finish_reason = "tool_calls"
     elif response_incomplete_content_filter:
         finish_reason = "content_filter"
-    elif (
-        leaked_tool_call_text
-        or scan.saw_streaming_or_item_incomplete
-        or ((scan.has_incomplete_items or scan.saw_commentary_phase) and not scan.saw_final_answer_phase)
-        or (reasoning_only and not trusted_final)
-    ):
+    elif non_reasoning_incomplete or (reasoning_only and not trusted_final):
         finish_reason = "incomplete"
     else:
         finish_reason = "stop"
+    # Preserve the exclusive cause at the scan boundary; blank content alone loses
+    # leaked-action / unfinished-child evidence, even when reasoning coexists.
+    assistant_message.codex_incomplete_reason = (
+        "completed_reasoning_only"
+        if finish_reason == "incomplete" and response_status == "completed"
+        and scan.saw_reasoning_item and not non_reasoning_incomplete
+        else None
+    )
     return assistant_message, finish_reason
