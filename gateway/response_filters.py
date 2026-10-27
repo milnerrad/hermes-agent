@@ -115,13 +115,28 @@ def is_intentional_silence_agent_result(agent_result: dict | None, response: Any
     ``silence_allowed`` still gates it by turn kind at the delivery seam, so a human
     turn that somehow carried the reason gets a visible fallback instead of a drop.
     """
-    if not (isinstance(agent_result, dict) and not agent_result.get("failed")):
+    if (not isinstance(agent_result, dict) or agent_result.get("completed") is False
+            or any(agent_result.get(key) for key in (
+                "failed", "partial", "interrupted", "error", "failure_reason",
+                "compression_exhausted", "compression_deferred",
+            ))):
         return False
     if is_intentional_silence_response(response):
         return True
-    return agent_result.get("turn_exit_reason") == NOTIFICATION_NO_REPLY_EXIT and not (
+    if agent_result.get("turn_exit_reason") != NOTIFICATION_NO_REPLY_EXIT or (
         isinstance(response, str) and response.strip()
-    )
+    ):
+        return False
+    # The quiet exit is only for a notice the model did not act on. An outstanding call
+    # or tool result in THIS turn is unfinished work, even with a stale quiet-exit reason.
+    for message in reversed(agent_result.get("messages") or []):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "user":
+            break
+        if message.get("role") in {"tool", "function"} or message.get("tool_calls") or message.get("function_call"):
+            return False
+    return True
 
 
 def display_kind_for_event(event: Any) -> str | None:

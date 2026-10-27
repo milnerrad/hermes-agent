@@ -82,6 +82,21 @@ def _finite_viewer_turn() -> bool:
     return finite_turn_required() is True
 
 
+def _runner_empty_response(result, platform, display_kind, history_len) -> str:
+    """Preserve a completed machinery quiet exit until the delivery policy can judge it."""
+    from gateway.response_filters import is_intentional_silence_agent_result, is_machinery_display_kind
+    from gateway.run import _normalize_empty_agent_response, _sanitize_gateway_final_response
+
+    # Normalizing first destroys the quiet exit by manufacturing a missing-response warning.
+    if is_machinery_display_kind(display_kind) and is_intentional_silence_agent_result(result, ""):
+        return ""
+    response = _normalize_empty_agent_response(result, "", history_len=history_len)
+    response = _sanitize_gateway_final_response(platform, response)
+    if not response:
+        response = t("gateway.shared.warn_passthrough", error=result["error"]) if result.get("error") else ""
+    return response
+
+
 def _persisted_turn(agent, agent_history, result, compressions) -> dict | None:
     """``message.complete.persisted_turn`` for this turn, the receipt the TUI gateway's own turns
     publish: clients bind the streamed reply to its stored row instead of comparing words. The
@@ -1207,7 +1222,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         every rebind. session_key propagates via contextvars (_set_session_env / set_current_session_key)
         — never os.environ["HERMES_SESSION_KEY"], which would misroute approvals across sessions.
         """
-        from gateway.run import _current_max_iterations, _normalize_empty_agent_response, _sanitize_gateway_final_response
+        from gateway.run import _current_max_iterations
         ctx = self._ctx
         runner = self._runner
         # Platform.LOCAL ("local") maps to the "cli" hint key the agent understands.
@@ -1390,10 +1405,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 **({"warning": result["warning"]} if isinstance(result.get("warning"), str) and result["warning"] else {}),
             }
         if not final_response:
-            final_response = _normalize_empty_agent_response(result, final_response or "", history_len=len(agent_history))
-            final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
-            if not final_response:
-                final_response = t("gateway.shared.warn_passthrough", error=result["error"]) if result.get("error") else ""
+            final_response = _runner_empty_response(
+                result, ctx.source.platform, ctx.persist_user_display_kind, len(agent_history),
+            )
             # NOTE: deliberately omits agent_persisted/response_reused (and last_reasoning outside a local
             # viewer's turn); the caller defaults agent_persisted differently when the key is absent.
             if local_sinks is not None:
