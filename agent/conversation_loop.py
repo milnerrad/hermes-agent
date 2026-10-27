@@ -319,12 +319,15 @@ def _moa_reference_metrics_for_hook(agent: Any) -> Any:
         return None
 
 
-def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text: str) -> None:
+def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text: str) -> bool:
     """Append a provider-safe checkpoint and correction to the live turn so role alternation
     holds and cached messages stay byte-identical. INVARIANTS: raw chain-of-thought never enters
     replayable content (inlined CoT reads as a prefill jailbreak and bricks the session with
     empty-response storms); the interruption scaffold is replay text carried only in the user
     correction's ``api_content``; an on-screen-empty placeholder is ``display_kind=hidden``."""
+    from agent.image_steering import defer_unsupported_images
+    if defer_unsupported_images(agent, text):
+        return False
     visible = agent._strip_think_blocks(getattr(agent, "_current_streamed_assistant_text", "") or "").strip()
 
     checkpoint_parts = [_INTERRUPT_SCAFFOLD_MARKER]
@@ -349,7 +352,14 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
         # as assistant text the model echoes it (#81841).
         append_message(messages, {"role": "assistant", "content": visible} if visible else hidden_interrupt_placeholder_row())
     # Transcript shows the user's own words; the provider replays the scaffolded form.
-    append_message(messages, {"role": "user", "content": text, "api_content": correction})
+    from agent.image_steering import ImageSteer
+    if isinstance(text, ImageSteer):
+        # Native blocks live on this newly appended user row, not a string-only
+        # api_content sidecar (which cannot durably preserve image blocks).
+        content = text.content(f"[Context from the interrupted assistant response]\n{checkpoint}\n\n")
+        append_message(messages, {"role": "user", "content": content})
+    else:
+        append_message(messages, {"role": "user", "content": text, "api_content": correction})
 
     # Stateful scrubber for <memory-context> spans split across stream deltas (#5719).  sanitize_context()
     # alone can't survive chunk boundaries because the block regex needs both tags in one string.
@@ -359,6 +369,7 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
     # learned a block was open and leaked delta2 as content).
     agent._current_streamed_assistant_text = ""
     agent._stream_needs_break = True
+    return True
 
 
 def _is_copilot_provider(agent: Any) -> bool:

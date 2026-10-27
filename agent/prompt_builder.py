@@ -591,8 +591,10 @@ def steer_user_row(steer_text: str) -> dict[str, Any]:
     result). Its own row — never smeared onto the already-persisted tool row, which append-only
     persistence would leave divergent from the live request — and typed so the alternation repair
     never merges the next real prompt into it and history renderers can label it."""
-    return {"role": "user", "content": format_steer_marker(steer_text).lstrip(),
-            "display_kind": STEER_DISPLAY_KIND}
+    from agent.image_steering import ImageSteer
+    content = (steer_text.content(STEER_MARKER_OPEN, STEER_MARKER_CLOSE)
+               if isinstance(steer_text, ImageSteer) else format_steer_marker(steer_text).lstrip())
+    return {"role": "user", "content": content, "display_kind": STEER_DISPLAY_KIND}
 
 
 STEER_CHANNEL_NOTE = (

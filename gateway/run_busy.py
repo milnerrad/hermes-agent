@@ -143,6 +143,15 @@ class GatewayBusySessionMixin:
         # else: no adapter — leave the head in place so we don't silently drop it.
         return pending_event
 
+    def _queue_unconsumed_image_event(self, session_key: str, event: MessageEvent, adapter: Any) -> None:
+        """Return an image-bearing admission without promoting it over unrelated queued work."""
+        overflow = self._session_state(session_key).conversation.queued_events
+        if overflow or adapter is None or not isinstance(getattr(adapter, "_pending_messages", None), dict):
+            overflow.append(event)
+            event._gateway_accepted = True
+        else:
+            self._enqueue_fifo(session_key, event, adapter)
+
     def _defer_past_exhaustion_reset(
         self, result: Any, adapter: Any, source: SessionSource, session_key: str, pending_event: MessageEvent,
     ) -> None:
@@ -154,6 +163,16 @@ class GatewayBusySessionMixin:
         keeps its usual place ahead of that event instead of vanishing.
         """
         leftover_steer = (result.get("pending_steer") or "").strip()
+        from agent.image_steering import ImageSteer, ImageSubmission
+        if isinstance(leftover_steer, ImageSteer):
+            adapter._pending_messages[session_key] = pending_event
+            for part in leftover_steer.parts:
+                if isinstance(part, ImageSubmission):
+                    self._queue_unconsumed_image_event(session_key, part.fallback, adapter)
+                elif part.strip():
+                    self._queue_unconsumed_image_event(session_key, MessageEvent(text=part, source=source), adapter)
+            adapter._pending_messages[session_key] = pending_event
+            return
         if leftover_steer:
             steer_prompt, steer_source = self._pinned_channel_inputs(session_key, None, source, internal=True)
             self._session_state(session_key).conversation.queued_events.insert(0, pending_event)
@@ -168,6 +187,22 @@ class GatewayBusySessionMixin:
         """Fold a leftover /steer (arrived after the last tool batch) into the post-turn drain:
         the next user turn when nothing else is pending, otherwise ahead of / behind it in the FIFO."""
         leftover_steer = (result.get("pending_steer") or "").strip() if result else None
+        from agent.image_steering import ImageSteer, ImageSubmission
+        if isinstance(leftover_steer, ImageSteer):
+            # Unconsumed image submissions return as their ORIGINAL events, not as
+            # a caption/path-only synthetic text. Do not reorder any unrelated FIFO.
+            for part in leftover_steer.parts:
+                if isinstance(part, ImageSubmission):
+                    event = part.fallback
+                elif part.strip():
+                    event = MessageEvent(text=part, source=source)
+                else:
+                    continue
+                if pending_event is None and not pending:
+                    pending_event = event
+                elif session_key:
+                    self._queue_unconsumed_image_event(session_key, event, adapter)
+            return pending_event, pending
         if leftover_steer:
             if not pending and not pending_event:
                 pending = leftover_steer
@@ -196,7 +231,6 @@ class GatewayBusySessionMixin:
                     session_key, pending[:40],
                 )
             elif pending and not pending_event:
-                from gateway.platforms.base import MessageEvent
                 # A deferred steer continues the active channel context, just like an
                 # eventless follow-up. Reuse its pins without marking the user as internal.
                 steer_prompt, steer_source = self._pinned_channel_inputs(
@@ -673,6 +707,9 @@ class GatewayBusySessionMixin:
     ) -> GatewayRunner._BusySteerOutcome:
         """Apply interrupt->queue demotions, then attempt steer (steer mode) or redirect (interrupt mode)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        from gateway.busy_images import non_audio_media, resolve_busy_images
+        if non_audio_media(event):
+            return await resolve_busy_images(self, event, session_key, effective_mode, running_agent)
         # Steer injects mid-run via running_agent.steer(), falling back to queue (nothing lost) when
         # the agent isn't running yet, lacks steer(), or the payload is empty. Interrupt is demoted
         # to queue while subagents run (interrupt() would abort them); /stop and /new still cancel all.
@@ -740,7 +777,32 @@ class GatewayBusySessionMixin:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
 
-    def _redirect_active_turn(self, running_agent, text: str, session_key: str, event: MessageEvent) -> bool:
+    async def _redirect_busy_images(
+        self, running_agent, event: MessageEvent, session_key: str, mode: str = "interrupt",
+    ) -> bool:
+        from gateway.busy_images import prepare_image_steer
+        try:
+            with self._profile_scope_for_source(event.source):
+                payload = await asyncio.to_thread(prepare_image_steer, self, running_agent, event)
+                # File decoding yields the event loop. Revalidate ownership/protection
+                # after it, never deliver to a finished/replaced or now-compressing run.
+                if payload is None or await self._session_has_compression_in_flight(session_key):
+                    return False
+                state = self._peek_session_state(session_key)
+                if (state is None or state.turn.agent is not running_agent
+                        or self._agent_has_active_subagents(running_agent)):
+                    return False
+                return self._redirect_active_turn(
+                    running_agent, payload, session_key, event,
+                    image_verb="steer_images" if mode == "steer" else "redirect_images",
+                )
+        except Exception:
+            logger.debug("Busy image preparation declined for %s; preserving queued media", session_key, exc_info=True)
+            return False
+
+    def _redirect_active_turn(
+        self, running_agent, text: str, session_key: str, event: MessageEvent, *, image_verb="redirect_images",
+    ) -> bool:
         """``redirect()`` the running turn onto *event* and re-anchor its delivery to that message.
 
         The turn's reply anchor and ledger identity were bound to the message that OPENED it, and
@@ -748,7 +810,10 @@ class GatewayBusySessionMixin:
         to *event*, so the reply must quote it (#115001). Both redirect entry points (busy
         interrupt mode and the priority path) go through here.
         """
-        if not self._try_agent_verb(running_agent, "redirect", text, session_key, event=event):
+        from agent.image_steering import ImageSteer
+        images = isinstance(text, ImageSteer)
+        if not self._try_agent_verb(running_agent, image_verb if images else "redirect", text,
+                                    session_key, event=None if images else event):
             return False
         turn = self._fold_into_running_turn(running_agent, session_key, event)
         if turn is None:

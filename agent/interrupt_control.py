@@ -9,6 +9,7 @@ import threading
 from typing import Optional
 
 from agent.interrupt_compat import request_hard_interrupt
+from agent.image_steering import ImageSteer, join_steers
 from tools.interrupt import request_yield as _request_yield
 from tools.interrupt import set_interrupt as _set_interrupt
 
@@ -99,7 +100,7 @@ def _steer_parts(agent) -> list:
 
 def _set_steer_parts(agent, parts: list) -> None:
     agent._pending_steer_parts = parts
-    agent._pending_steer = "\n".join(text for _, text in parts) or None
+    agent._pending_steer = join_steers(text for _, text in parts) or None
 
 
 def _steer_fates(agent) -> dict:
@@ -320,6 +321,22 @@ class InterruptControlMixin:
         self._turn_user_intervened = True
         return True
 
+    def steer_images(self, text: ImageSteer) -> bool:
+        """Buffer native images without aborting the active model request."""
+        if (not isinstance(text, ImageSteer)
+                or self.api_mode not in ("chat_completions", "codex_responses")
+                or self._model_supports_vision() is not True):
+            return False
+        return self.steer(text)
+
+    def redirect_images(self, text: ImageSteer) -> bool:
+        """Native image correction on the ordinary loop; unsupported runtimes must queue it."""
+        if (not isinstance(text, ImageSteer)
+                or self.api_mode not in ("chat_completions", "codex_responses")
+                or self._model_supports_vision() is not True):
+            return False
+        return self.redirect(text)
+
     def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task: during a model request only that
         request is cancelled (completed messages kept, partial reasoning becomes assistant context, the
@@ -367,7 +384,7 @@ class InterruptControlMixin:
             if self._interrupt_requested and not existing:
                 return False
             self._pending_redirect = (
-                f"{existing}\n\n[Additional user correction]\n{cleaned}" if existing else cleaned
+                join_steers((existing, cleaned), "\n\n[Additional user correction]\n") if existing else cleaned
             )
             self._interrupt_requested = True
             self._interrupt_message = None
@@ -411,10 +428,18 @@ class InterruptControlMixin:
         """The turn finalizer's drain: return and clear the ticketless steers (they become the next user
         turn) and keep each ticketed one buffered. A transfer is never a follow-up a restart may discard:
         settlement withdraws it and its admission goes back to its own queue place."""
+        # A fatal request exit can finalize before its accepted image redirect was
+        # materialized. Lock order matches interrupt: redirect, then steer.
+        with _ic_lock(self, "_pending_redirect_lock"):
+            redirect = _ic_slot(self, "_pending_redirect_lock", "_pending_redirect")
+            if isinstance(redirect, ImageSteer):
+                with _ic_lock(self, "_pending_steer_lock"):
+                    _set_steer_parts(self, _steer_parts(self) + [(None, redirect)])
+                self._pending_redirect = None
         with _ic_lock(self, "_pending_steer_lock"):
             parts = _steer_parts(self)
             _set_steer_parts(self, [part for part in parts if part[0] is not None])
-        return "\n".join(text for ticket, text in parts if ticket is None) or None
+        return join_steers(text for ticket, text in parts if ticket is None) or None
 
     def withdraw_steer(self, ticket) -> bool:
         """Settle one ``steer(text, ticket=...)`` by identity (the gateway's transfer of a queued prompt):

@@ -602,10 +602,18 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             # interrupt_then_dispatch / reject). Unrecognized commands and plain text fall through.
             return True, await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source)
 
-        # Telegram photo bursts arrive as near-simultaneous updates — never interrupt for a
-        # photo-only follow-up; adapter-level batching absorbs them.
-        if event.message_type == MessageType.PHOTO:
-            logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
+        # Adapter albums are already coalesced. Resolve human image corrections through
+        # the SAME protection/capability gates as ordinary busy ingress before queueing.
+        from gateway.busy_images import non_audio_media
+        if event.message_type == MessageType.PHOTO or non_audio_media(event):
+            state = self._peek_session_state(_quick_key)
+            agent = state.turn.agent if state else None
+            if not self._draining:
+                outcome = await self._resolve_busy_steer_or_redirect(
+                    event, _quick_key, self._effective_busy_input_mode(source), agent,
+                )
+                if outcome.redirected or outcome.steered:
+                    return True, None
             self._hm_merge_pending_for_source(source, _quick_key, event)
             return True, None
         return False, None

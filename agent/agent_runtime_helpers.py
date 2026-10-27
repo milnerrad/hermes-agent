@@ -3704,29 +3704,22 @@ def _requeue_pending_steer(agent, steer_text: str) -> None:
 
 
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
-    """Persist any pending /steer text as a standalone user message.
+    """Persist pending text/native-image steering as a NEW user row after the tool batch.
 
-    Called at the end of a tool-call batch, before the next API call.
-
-    The steer is emitted as a NEW ``role:"user"`` message appended after the
-    last tool result (marker text included), so:
-
-    - the model still sees the self-describing out-of-band marker (same text,
-      same provenance semantics);
-    - message-role alternation stays legal — ``assistant(tool_calls) → tool →
-      user`` is the documented "user jumped in mid-run" pattern that
-      ``repair_message_sequence`` deliberately keeps;
-    - the appended dict carries no ``_DB_PERSISTED_MARKER`` yet, so the next
-      ``_flush_messages_to_session_db`` writes it to the session store — the
-      steer text finally becomes part of the durable transcript instead of
-      being smeared onto an already-persisted tool row that append-only
-      persistence never rewrites (replayed histories then diverge from the
-      live request bytes and break the provider prompt cache).
+    The row keeps the out-of-band provenance marker and legal role sequence
+    ``assistant(tool_calls) → tool → user`` (which repair_message_sequence preserves).
+    It has no ``_DB_PERSISTED_MARKER``, so the next session flush stores exactly the
+    provider-facing bytes. Never smear steering onto a previously persisted tool
+    row: append-only persistence would diverge from replay and break prompt caching.
+    Unsupported images stay buffered for the original-event fallback.
     """
     if num_tool_msgs <= 0 or not messages:
         return
     steer_text = agent._drain_pending_steer()
     if not steer_text:
+        return
+    from agent.image_steering import defer_unsupported_images
+    if defer_unsupported_images(agent, steer_text):
         return
     # Skip non-tool messages in the tail in case something else is appended at the boundary.
     tail = range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1)
