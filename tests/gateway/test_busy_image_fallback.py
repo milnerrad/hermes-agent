@@ -5,7 +5,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from tests.gateway.test_busy_images import setup_images  # shared real-cache fixture
+from tests.gateway import test_busy_images as image_fixtures
+
+setup_images = image_fixtures.setup_images
 
 
 @pytest.mark.asyncio
