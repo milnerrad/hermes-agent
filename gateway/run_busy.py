@@ -169,7 +169,7 @@ class GatewayBusySessionMixin:
             for part in leftover_steer.parts:
                 if isinstance(part, ImageSubmission):
                     self._queue_unconsumed_image_event(session_key, part.fallback, adapter)
-                elif part.strip():
+                elif isinstance(part, str) and part.strip():
                     self._queue_unconsumed_image_event(session_key, MessageEvent(text=part, source=source), adapter)
             adapter._pending_messages[session_key] = pending_event
             return
@@ -194,7 +194,7 @@ class GatewayBusySessionMixin:
             for part in leftover_steer.parts:
                 if isinstance(part, ImageSubmission):
                     event = part.fallback
-                elif part.strip():
+                elif isinstance(part, str) and part.strip():
                     event = MessageEvent(text=part, source=source)
                 else:
                     continue

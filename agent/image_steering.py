@@ -16,9 +16,15 @@ class ImageSubmission:
     fallback: Any
 
 
+@dataclass(frozen=True)
+class SteerSeparator:
+    """Rendering metadata, never an authored input to recover as a new turn."""
+    text: str
+
+
 class ImageSteer(str):
-    parts: tuple[str | ImageSubmission, ...]
-    def __new__(cls, text: str, parts: tuple[str | ImageSubmission, ...]):
+    parts: tuple[str | ImageSubmission | SteerSeparator, ...]
+    def __new__(cls, text: str, parts: tuple[str | ImageSubmission | SteerSeparator, ...]):
         value = super().__new__(cls, text)
         value.parts = parts
         return value
@@ -31,7 +37,7 @@ class ImageSteer(str):
         if prefix:
             blocks.append({"type": "text", "text": prefix})
         for part in self.parts:
-            text = part.text if isinstance(part, ImageSubmission) else part
+            text = part.text if isinstance(part, (ImageSubmission, SteerSeparator)) else part
             blocks.append({"type": "text", "text": text})
             if isinstance(part, ImageSubmission):
                 blocks.extend({"type": "image_url", "image_url": {"url": url}} for url in part.urls)
@@ -68,6 +74,6 @@ def join_steers(parts, separator="\n"):
     chunks = []
     for index, part in enumerate(parts):
         if index:
-            chunks.append(separator)
+            chunks.append(SteerSeparator(separator))
         chunks.extend(part.parts if isinstance(part, ImageSteer) else (part,))
     return ImageSteer(text, tuple(chunks))
