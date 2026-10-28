@@ -490,6 +490,7 @@ class CompressionCommitFence:
         self._last_progress = time.monotonic()
         self._progress_observed = False
         self._deadline: float | None = None
+        self._hard_deadline_monotonic: float | None = None
         self._retain_cancelled_lock_until_worker_done = False
         # Set once the active-row watermark is captured: later rows survive as tail, so hosts may keep admission.
         self._commit_watermark_fenced = False
@@ -501,20 +502,34 @@ class CompressionCommitFence:
         seconds = float(seconds)
         if seconds <= 0:
             raise ValueError("total compression ceiling must be positive")
-        self._deadline = time.monotonic() + seconds
+        deadline = time.monotonic() + seconds
+        self._deadline = min(deadline, self._hard_deadline_monotonic or deadline)
 
     def set_precommit_deadline_monotonic(self, deadline: float) -> None:
         """Arm one absolute pre-commit deadline shared across route attempts (primary + stall retry)."""
         deadline = float(deadline)
         if deadline <= 0:
             raise ValueError("compression deadline must be positive")
-        self._deadline = deadline
+        self._deadline = min(deadline, self._hard_deadline_monotonic or deadline)
+
+    @property
+    def hard_deadline_monotonic(self) -> Optional[float]:
+        # Like deadline_monotonic, host reads must never block behind an admitted commit.
+        return self._hard_deadline_monotonic
+
+    def limit_precommit_deadline(self, seconds: float) -> None:
+        """Bound the entire native-backup attempt, including prep, without prompt-reading extensions."""
+        with self._lock:
+            deadline = time.monotonic() + max(0.0, float(seconds))
+            self._hard_deadline_monotonic = min(deadline, self._hard_deadline_monotonic or deadline,
+                                                self._deadline or deadline)
+            self._deadline = min(self._deadline or deadline, self._hard_deadline_monotonic)
 
     def extend_deadline(self, seconds: float) -> bool:
         """Push the armed deadline back by *seconds* (time llama-server spent reading the prompt). A cancelled
         attempt or a passed deadline stays final, so a late progress chunk can't revive it; while a commit or a
         cancellation holds the lock there is nothing to extend."""
-        if seconds <= 0 or not self._lock.acquire(blocking=False):
+        if self._hard_deadline_monotonic is not None or seconds <= 0 or not self._lock.acquire(blocking=False):
             return False
         try:
             alive = self._deadline is not None and self._deadline > time.monotonic() and not self.is_cancelled
@@ -1221,6 +1236,8 @@ def run_compress_context_with_progress_timeout(
         idle = min(idle, ceiling)
     fence = fence if fence is not None else CompressionCommitFence()
     fence.set_precommit_deadline_monotonic(precommit_deadline_monotonic)
+    # Native backup cancellation preserves history: no new model call or deterministic discard.
+    stall_fallback = stall_fallback and fence.hard_deadline_monotonic is None
     # Read BEFORE this attempt runs: the host's ``stalled`` record and the cancelled worker's
     # ``stall_interrupted`` record both land during the unwind below, and this stall must not count as
     # One prior timeout-class failure = the route already burned a full idle window. An over-window request

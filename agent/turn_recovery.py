@@ -501,6 +501,7 @@ def _recover_format_errors(
         from agent.native_compaction import is_native_compaction_rejection
         if is_native_compaction_rejection(api_error, getattr(api_error, "status_code", None)):
             _retry.native_compaction_reject_retry_attempted = True
+            agent._native_compaction_rejected = True
             agent.codex_responses_native_compaction = False
             _vlines(
                 agent,

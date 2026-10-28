@@ -61,7 +61,9 @@ def effective_ceiling(fence: CompressionCommitFence, ceiling: float, wait_starte
     """The total limit for a host that started waiting at *wait_started*: the configured
     *ceiling*, or longer once prompt reading pushed the fence deadline back."""
     deadline = fence.deadline_monotonic
-    return ceiling if deadline is None else max(ceiling, deadline - wait_started)
+    effective = ceiling if deadline is None else max(ceiling, deadline - wait_started)
+    hard_deadline = fence.hard_deadline_monotonic
+    return effective if hard_deadline is None else min(effective, max(0.0, hard_deadline - wait_started))
 
 
 @contextlib.contextmanager

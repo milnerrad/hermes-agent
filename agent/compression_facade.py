@@ -132,6 +132,10 @@ def _run_under_progress_timeout(
         CompressionCommitFence, request_exceeds_model_window, run_compress_context_with_progress_timeout,
     )
 
+    from agent.auxiliary_stream_progress import AuxStreamProgress
+    from agent.auxiliary_client import aux_stream_observation_hook
+    progress = AuxStreamProgress()
+
     def _snapshot_worker(fence=None, *, same_turn_fallback_recovery=False):
         # #76354 review F3: the pooled worker must NEVER share the caller's live transcript. Plugin/legacy
         # context engines are allowed to mutate their input list in place; after a host timeout the worker
@@ -142,9 +146,10 @@ def _run_under_progress_timeout(
         # on timeout/cancel); durable SessionDB mutation is already gated behind the commit fence inside
         # compress_context.
         snapshot = copy.deepcopy(messages)
-        result_msgs, result_prompt = run(
-            fence, target_messages=snapshot, same_turn_fallback_recovery=same_turn_fallback_recovery
-        )
+        with aux_stream_observation_hook(progress.observe):
+            result_msgs, result_prompt = run(
+                fence, target_messages=snapshot, same_turn_fallback_recovery=same_turn_fallback_recovery
+            )
         return (messages if result_msgs is snapshot else result_msgs), result_prompt
 
     # The stall-fallback retry is the same recovery attempt as the stalled primary, but the cancelled primary
@@ -154,8 +159,10 @@ def _run_under_progress_timeout(
     _same_turn_fallback_worker = functools.partial(_snapshot_worker, same_turn_fallback_recovery=True)
 
     timeout_cause = {"total_exhausted": False, "progress_observed": False}
+    timeout_kind: list[str | None] = [None]
 
     def _on_timeout_cause(total_exhausted, progress_observed):
+        timeout_kind[0] = "total_ceiling" if total_exhausted else "idle"
         timeout_cause.update(total_exhausted=total_exhausted, progress_observed=progress_observed)
 
     def _on_timeout(idle, waited, since_progress):
@@ -175,15 +182,23 @@ def _run_under_progress_timeout(
                 agent._active_compression_commit_fence = retry_fence
         return retry_fence
 
-    return run_compress_context_with_progress_timeout(
-        worker=_snapshot_worker, messages=messages,
-        system_prompt_fallback=lambda: _timeout_fallback_prompt(agent, system_message),
-        idle_timeout_seconds=idle_timeout, total_ceiling_seconds=total_ceiling, on_timeout=_on_timeout,
-        on_timeout_cause=_on_timeout_cause,
-        on_commit_overrun=lambda waited, ceiling: _warn_commit_overrun(agent, waited, ceiling), fence=active_fence,
-        telemetry_agent=agent, new_fence=_publish_new_fence, fallback_worker=_same_turn_fallback_worker,
-        request_exceeds_window=request_exceeds_model_window(agent, approx_tokens) is True,
-    )
+    try:
+        return run_compress_context_with_progress_timeout(
+            worker=_snapshot_worker, messages=messages,
+            system_prompt_fallback=lambda: _timeout_fallback_prompt(agent, system_message),
+            idle_timeout_seconds=idle_timeout, total_ceiling_seconds=total_ceiling, on_timeout=_on_timeout,
+            on_timeout_cause=_on_timeout_cause,
+            on_commit_overrun=lambda waited, ceiling: _warn_commit_overrun(agent, waited, ceiling), fence=active_fence,
+            telemetry_agent=agent, new_fence=_publish_new_fence, fallback_worker=_same_turn_fallback_worker,
+            request_exceeds_window=request_exceeds_model_window(agent, approx_tokens) is True,
+        )
+    finally:
+        # Snapshot on HOST unwind, not worker unwind: abandoned transports may never return.
+        from agent.conversation_compression_telemetry import emit_compression_stream_progress
+        emit_compression_stream_progress(
+            progress, registration.fence, idle=idle_timeout, ceiling=total_ceiling,
+            timeout_kind=timeout_kind[0],
+        )
 
 
 def _mirror_result_onto_live_lists(agent, result, messages, *, direct_path: bool) -> None:
@@ -283,21 +298,30 @@ class CompressionFacadeMixin:
                 self._active_compression_commit_fence = active_fence
 
             def _run(fence=None, target_messages=None, same_turn_fallback_recovery=False):
-                return compress_context(
-                    self, target_messages if target_messages is not None else messages, system_message,
-                    approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic, force=force,
-                    bypass_cooldown=bypass_cooldown or same_turn_fallback_recovery,
-                    defer_context_engine_notification=(defer_context_engine_notification), commit_fence=fence,
-                    verbatim_tail=verbatim_tail, trigger=trigger, snapshot_is_current=snapshot_is_current,
-                    overflow_reason=overflow_reason,
-                )
+                from agent.native_backup_timeout import native_backup_scope
+                with native_backup_scope(fence is not None and fence.hard_deadline_monotonic is not None):
+                    return compress_context(
+                        self, target_messages if target_messages is not None else messages, system_message,
+                        approx_tokens=approx_tokens, task_id=task_id, focus_topic=focus_topic, force=force,
+                        bypass_cooldown=bypass_cooldown or same_turn_fallback_recovery,
+                        defer_context_engine_notification=(defer_context_engine_notification), commit_fence=fence,
+                        verbatim_tail=verbatim_tail, trigger=trigger, snapshot_is_current=snapshot_is_current,
+                        overflow_reason=overflow_reason,
+                    )
 
             # Callers that already own a progress-aware wait (gateway session
             # hygiene) pass commit_fence and must not be double-wrapped.
             direct_path = commit_fence is not None
             if not direct_path:
                 idle_timeout, total_ceiling = resolve_context_compression_timeouts()
-                direct_path = idle_timeout <= 0
+            else:
+                idle_timeout, total_ceiling = 0.0, 600.0
+            from agent.native_backup_timeout import native_backup_timeouts
+            backup_budgets = native_backup_timeouts(self, force=force, idle=idle_timeout, ceiling=total_ceiling)
+            if backup_budgets is not None:
+                idle_timeout, total_ceiling = backup_budgets
+                active_fence.limit_precommit_deadline(total_ceiling)
+            direct_path = direct_path or idle_timeout <= 0
             if direct_path:
                 result = _run(active_fence)
             else:

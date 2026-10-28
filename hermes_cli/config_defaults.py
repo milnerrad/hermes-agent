@@ -663,7 +663,8 @@ DEFAULT_CONFIG = {
         # Inactivity budget for in-agent compress_context (loop, /compress, preflight); same
         # progress-aware semantics as hygiene_timeout_seconds. 0 = disable the owned wrapper
         # (callers passing commit_fence, e.g. gateway hygiene, never use it). Floored at the auxiliary
-        # compression request timeout (auxiliary.compression.timeout, min 300s): the host never judges
+        # compression request timeout (auxiliary.compression.timeout, default floor 300s; an explicit
+        # positive user timeout is honored): the host never judges
         # silence before the summary request itself would time out.
         "context_timeout_seconds": 120,
         # Absolute cap on the *pre-commit* compress_context wait (summary/stream phase) even while
@@ -671,6 +672,10 @@ DEFAULT_CONFIG = {
         # commit is never abandoned: past the ceiling it is logged (WARNING, then ERROR) and
         # surfaced on the warning channel while the host keeps waiting.
         "context_total_ceiling_seconds": 600,
+        # Automatic Hermes backup of eligible OpenAI-native compaction: hard pre-commit budget,
+        # including prep/chunks/retries. Never extended by reasoning, whitespace or prompt reading.
+        # Positive finite seconds; shorter host ceilings win. Manual force=True keeps ordinary budgets.
+        "native_backup_timeout_seconds": 120,
         # Non-system head messages always kept verbatim, in ADDITION to the (always protected)
         # system prompt. 0 = pin nothing but system prompt + summary + tail.
         "protect_first_n": 3,

@@ -303,6 +303,7 @@ class _AuxiliaryCancellationDecision:
 _aux_progress = threading.local()
 _aux_dispatch = threading.local()
 _aux_provider_response = threading.local()
+_aux_stream_observation = threading.local()
 # Absolute monotonic deadline of the waiting HOST. The stream's own ceiling
 # (_aux_stream_total_ceiling, >= the host's and started later) would otherwise leave an
 # orphaned stream still billing after every host-ceiling timeout.
@@ -409,6 +410,13 @@ def _aux_thread_local_hook(local: threading.local, hook):
 
 
 @contextlib.contextmanager
+def aux_stream_observation_hook(hook):
+    """Observe Codex events without changing liveness/cancellation policy; never log the event."""
+    with _aux_thread_local_hook(_aux_stream_observation, hook):
+        yield
+
+
+@contextlib.contextmanager
 def aux_progress_hook(hook):
     """Install *hook* as the current thread's aux forward-progress callback (None = passthrough)."""
     with _aux_thread_local_hook(_aux_progress, hook):
@@ -464,6 +472,7 @@ def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any],
     progress_hook = getattr(_aux_progress, "hook", None)
     dispatch_hook = getattr(_aux_dispatch, "hook", None)
     provider_response_hook = getattr(_aux_provider_response, "hook", None)
+    stream_observation_hook = getattr(_aux_stream_observation, "hook", None)
     host_deadline = getattr(_aux_stream_deadline, "value", None)
     reading_hook = current_prompt_reading_hook()
     # #99692: the stream is consumed on the daemon below, and thread-locals do not cross that boundary — an
@@ -479,6 +488,7 @@ def _run_protected_sync_provider_call(callback: Callable[[dict[str, Any]], Any],
                 aux_progress_hook(progress_hook),
                 _aux_thread_local_hook(_aux_dispatch, dispatch_hook),
                 _aux_thread_local_hook(_aux_provider_response, provider_response_hook),
+                aux_stream_observation_hook(stream_observation_hook),
                 aux_stream_deadline(host_deadline), prompt_reading_hook(reading_hook),
                 aux_interrupt_protection(cancel_check=cancel_check),
             ):
@@ -1364,6 +1374,13 @@ class _CodexStreamGuard:
         self.check_cancelled()
 
     def on_event(self, _event: Any) -> None:
+        observer = getattr(_aux_stream_observation, "hook", None)
+        if callable(observer):
+            try:
+                observer(_event)
+            except Exception:
+                # Diagnostics must neither interrupt the stream nor serialize event/error content.
+                pass
         # TTFP telemetry records every frame, but forward progress (compression commit fence,
         # no-progress window) counts only substantive payloads — keepalives must not re-arm,
         # so a zombie stream dies at the same window as a dead connection.
@@ -6355,10 +6372,14 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
 
 
 def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
-    """Explicit ``timeout`` wins, else config; compression gets a floor so a reasoning model
-    summarising a large context isn't cut off."""
+    """Explicit per-call or positive user timeout wins; otherwise retain the compression floor."""
     if timeout is not None:
         return timeout
+    if task == "compression":
+        from agent.auxiliary_task_config import explicit_task_timeout
+        explicit = explicit_task_timeout(task)
+        if explicit is not None:
+            return explicit
     effective = _get_task_timeout(task)
     return max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS) if task == "compression" else effective
 

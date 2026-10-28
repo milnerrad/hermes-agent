@@ -5246,14 +5246,15 @@ Write only the summary body. Do not include any preamble or prefix."""
             ((failure_class, message) for flag, failure_class, message in _TERMINAL_SUMMARY_FAILURES if getattr(self, flag)),
             None,
         )
-        if terminal_failure is None and not self.abort_on_summary_failure:
+        from agent.native_backup_timeout import native_backup_preserves_history
+        if terminal_failure is None and not self.abort_on_summary_failure and not native_backup_preserves_history():
             return False
         self._last_summary_dropped_count = 0  # nothing actually dropped
         self._last_summary_fallback_used = False
         self._last_compress_aborted = True
         failure_class, message = terminal_failure or (
             "summary_generation_aborted",
-            "Summary generation failed — aborting compression (compression.abort_on_summary_failure=true). "
+            "Summary generation failed — aborting compression (configured preservation or bounded native backup). "
             "%d message(s) preserved unchanged. Conversation is frozen until the next /compress or /new.",
         )
         telemetry["failure_class"] = failure_class

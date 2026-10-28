@@ -87,6 +87,24 @@ def _task_config(task: str, _seen: frozenset) -> dict[str, Any]:
     return task_config
 
 
+def explicit_task_timeout(task: str) -> float | None:
+    """Read a positive user timeout without mistaking merged defaults for intent."""
+    import math
+    from hermes_cli.config import read_raw_config
+
+    config = read_raw_config()
+    aux = config.get("auxiliary", {})
+    block = aux.get(task, {}) if isinstance(aux, dict) else {}
+    raw = block.get("timeout") if isinstance(block, dict) else None
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
 # The fields that together pick WHERE a call goes. They travel as one unit: a provider pinned on an
 # inheriting task must never pick up the base's base_url/api_key (that would send one vendor's key
 # to another's endpoint).

@@ -87,6 +87,21 @@ def _log_attempt_record(payload: dict[str, Any]) -> None:
 _CANDIDATE_EFFECT_FIELDS = ("messages_after", "tokens_after", "tokens_reclaimed", "items_dropped")
 
 
+def emit_compression_stream_progress(progress, fence, *, idle, ceiling, timeout_kind=None) -> None:
+    """A host-owned sanitized snapshot, even when a cancelled worker never unwinds."""
+    try:
+        _log_attempt_record({
+            "event": "compression_stream_progress", "route": "hermes",
+            "duration_ms": max(0, int((time.monotonic() - progress.started_at) * 1000)),
+            "idle_timeout_seconds": idle, "total_ceiling_seconds": ceiling,
+            "native_backup": fence.hard_deadline_monotonic is not None,
+            "cancelled": fence.is_cancelled, "timeout_cause": timeout_kind,
+            "liveness_observed": fence.progress_observed, **progress.snapshot(),
+        })
+    except Exception:
+        logger.debug("failed to emit sanitized compression stream progress")
+
+
 def _emit_compression_attempt_telemetry(
     agent: Any, *, started_at: float, commit_status: str, split_status: str, failure_class: str | None = None,
     commit_started_at: float | None = None, include_last_telemetry: bool = True,
