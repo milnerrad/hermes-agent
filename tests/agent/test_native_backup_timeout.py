@@ -94,6 +94,33 @@ def test_per_call_override_and_unrelated_tasks_keep_their_budget(monkeypatch):
     assert aux._effective_aux_timeout("title_generation", None) == 20
 
 
+@pytest.mark.parametrize("scoped,live", [(420, 15), (420, 600), (15, None)])
+def test_frozen_session_timeout_is_authoritative_over_live_raw(monkeypatch, scoped, live):
+    from agent.auxiliary_task_config import session_auxiliary_scope
+    raw = {} if live is None else {"auxiliary": {"compression": {"timeout": live}}}
+    def forbidden_live_read():
+        raise AssertionError("a frozen session must not read live timeout policy")
+    monkeypatch.setattr(config, "read_raw_config", forbidden_live_read)
+    with session_auxiliary_scope({"compression": {"timeout": scoped}}):
+        assert aux._effective_aux_timeout("compression", None) == scoped
+        assert aux._effective_aux_timeout("compression", 9) == 9
+    monkeypatch.setattr(config, "read_raw_config", lambda: raw)
+
+
+def test_empty_session_policy_does_not_inherit_live_explicit_timeout(monkeypatch):
+    from agent.auxiliary_task_config import session_auxiliary_scope
+    monkeypatch.setattr(config, "read_raw_config", lambda: {"auxiliary": {"compression": {"timeout": 15}}})
+    monkeypatch.setattr(aux, "_get_task_timeout", lambda task: 120)
+    with session_auxiliary_scope({}):
+        assert aux._effective_aux_timeout("compression", None) == 300
+
+
+def test_effective_ceiling_accepts_legacy_deadline_fence_protocol():
+    from agent.conversation_compression_deadline import effective_ceiling
+    fence = SimpleNamespace(deadline_monotonic=150)
+    assert effective_ceiling(fence, 100, 20) == 130
+
+
 def test_native_fence_never_relaxes_an_existing_shorter_deadline():
     from agent.conversation_compression import CompressionCommitFence
     from agent.conversation_compression_deadline import effective_ceiling
