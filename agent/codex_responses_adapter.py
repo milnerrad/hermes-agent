@@ -763,6 +763,22 @@ def classify_responses_route(agent: Any) -> ResponsesRouteFlags:
     )
 
 
+def native_responses_owns_automatic_compaction(agent: Any) -> bool:
+    """Whether the next Responses request, not Hermes, owns proactive compaction.
+
+    Use the wire gate on every decision: opt-out, route/model changes, provider
+    rejection and checkpoint-required mode must immediately restore local admission.
+    Manual compression and provider-proven overflow recovery do not use this veto.
+    """
+    if getattr(agent, "api_mode", None) != "codex_responses":
+        return False
+    from agent.native_compaction import native_compaction_context_management
+
+    return bool(native_compaction_context_management(
+        agent, **classify_responses_route(agent)._asdict()
+    ))
+
+
 def _native_responses_replay_items(
     agent: Any, messages: list[dict[str, Any]]
 ) -> Optional[list[dict[str, Any]]]:

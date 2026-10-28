@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from agent.codex_responses_adapter import native_responses_owns_automatic_compaction
 from agent.context_engine import automatic_compaction_status_message
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE, PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
@@ -153,6 +154,8 @@ def _idle_compaction(
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
     if not (agent.compression_enabled and _idle_after > 0 and messages):
         return
+    if native_responses_owns_automatic_compaction(agent):
+        return
     _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
     if _idle_gap < _idle_after:
         return
@@ -239,6 +242,11 @@ def _preflight_compression(
     agent._turn_preflight_display_snapshot = None
     if not agent.compression_enabled:
         _rearm_uncompressed_overflow_warn(agent, out.messages, out.active_system_prompt)
+        return
+    # Native eligibility is an admission policy, not just a lower threshold:
+    # even anchored pressure must let the next provider request go first. Keep
+    # local feasibility clamps, warnings, pruning and engine maintenance out.
+    if native_responses_owns_automatic_compaction(agent):
         return
     _compressor = agent.context_compressor
     # A structural no-op ("nothing eligible among N messages") is a verdict about that transcript;

@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from agent.codex_responses_adapter import native_responses_owns_automatic_compaction
 from agent.context_engine import automatic_compaction_status_message
 from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE, _reset_read_dedup_caches, compression_blocked_transiently,
@@ -81,6 +82,11 @@ def run_preflight_compression(
             agent, v.messages, v.conversation_history, v.api_call_count, request_pressure_tokens,
             max_compression_attempts,
         )
+
+    # A real provider overflow is stronger evidence than proactive pressure;
+    # preserve its local recovery/fail-closed chain even on eligible native routes.
+    if not provider_overflow_preflight and native_responses_owns_automatic_compaction(agent):
+        return _done("fallthrough")
 
     _compression_cooldown = getattr(
         compressor, "get_active_compression_failure_cooldown", lambda: None
@@ -268,6 +274,10 @@ def compress_after_tool_results(
         )
 
     _compressor = agent.context_compressor
+    # Do not summarize or prune tool results before native gets a request. This
+    # also avoids auxiliary feasibility clamps changing the native threshold.
+    if native_responses_owns_automatic_compaction(agent):
+        return _verdict(False)
     # A new checkpoint must reach the provider before stale usage can trigger
     # local compression, overflow warnings, or destructive tool-result pruning.
     if bool(getattr(_compressor, "awaiting_real_usage_after_compression", False)):
