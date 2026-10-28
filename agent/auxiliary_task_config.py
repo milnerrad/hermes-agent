@@ -92,8 +92,12 @@ def explicit_task_timeout(task: str) -> float | None:
     import math
     from hermes_cli.config import read_raw_config
 
-    config = read_raw_config()
-    aux = config.get("auxiliary", {})
+    # A bound session policy is authoritative, including an absent timeout. Never
+    # let a live-file edit replace an already frozen turn's non-route policy.
+    aux = _SESSION_AUXILIARY.get()
+    if aux is None:
+        config = read_raw_config()
+        aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
     block = aux.get(task, {}) if isinstance(aux, dict) else {}
     raw = block.get("timeout") if isinstance(block, dict) else None
     if raw is None or isinstance(raw, bool):

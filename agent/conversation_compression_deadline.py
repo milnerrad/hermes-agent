@@ -62,7 +62,7 @@ def effective_ceiling(fence: CompressionCommitFence, ceiling: float, wait_starte
     *ceiling*, or longer once prompt reading pushed the fence deadline back."""
     deadline = fence.deadline_monotonic
     effective = ceiling if deadline is None else max(ceiling, deadline - wait_started)
-    hard_deadline = fence.hard_deadline_monotonic
+    hard_deadline = getattr(fence, "hard_deadline_monotonic", None)
     return effective if hard_deadline is None else min(effective, max(0.0, hard_deadline - wait_started))
 
 
